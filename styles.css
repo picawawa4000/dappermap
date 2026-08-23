@@ -1,0 +1,28 @@
+:root { --ink:#223027; --paper:#f7f4ea; --line:#d6d7c9; --green:#215638; --soft:#e8eee1; }
+* { box-sizing:border-box; } html, body { width:100%; height:100%; margin:0; overflow:hidden; background:linear-gradient(135deg,#f9f5e8,#dbe6d7); color:var(--ink); font-family:Georgia,serif; }
+.shell { display:grid; grid-template-columns:30rem minmax(0,1fr); gap:1.25rem; width:100vw; height:100vh; padding:1.25rem; } .sidebar { min-height:0; display:flex; flex-direction:column; gap:1.25rem; } .panel { background:color-mix(in srgb,var(--paper) 92%,white); border:1px solid var(--line); border-radius:1.25rem; box-shadow:0 1rem 3rem #3e57321a; } .page-switcher { padding:1rem; } .menu { min-height:0; overflow:auto; padding:1rem; } .map-stage { min-width:0; min-height:0; display:grid; place-items:center; } .map-frame { position:relative; width:100%; height:100%; overflow:hidden; border-radius:1.25rem; background:var(--paper); border:1px solid var(--line); touch-action:none; } canvas { position:absolute; inset:0; width:100%; height:100%; image-rendering:pixelated; } .field { display:grid; gap:.5rem; } .field span, summary { font-variant:small-caps; letter-spacing:.08em; font-weight:bold; } input, select, button { width:100%; border:1px solid var(--line); border-radius:.75rem; padding:.75rem 1rem; background:white; color:inherit; font:inherit; } button { border:0; background:var(--green); color:white; cursor:pointer; font-weight:bold; } .menu-section { border:1px solid var(--line); border-radius:1rem; overflow:hidden; } summary { padding:1rem; cursor:pointer; background:#f0eee4; } .menu-body { padding:1rem; display:grid; gap:.9rem; } .status { margin:0; line-height:1.35; color:#667365; } .error { color:#9e3028; } .actions { display:grid; grid-template-columns:1fr 1fr; gap:.5rem; } .editor-list { display:grid; gap:.45rem; } .biome-row { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:.5rem; align-items:center; padding:.5rem; border-bottom:1px solid var(--line); } .biome-header,.biome-row-header { min-width:0; display:flex; gap:.55rem; align-items:center; } .biome-swatch { width:1rem; height:1rem; border-radius:50%; border:1px solid #0002; flex:0 0 auto; } .biome-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.85rem; } .structure-enabled-input { width:1.2rem; height:1.2rem; } .structure-color-input { width:2rem; height:2rem; padding:.15rem; } .debug-metrics dl { margin:0; display:grid; gap:.5rem; } .debug-metrics dl div { display:flex; justify-content:space-between; gap:1rem; } .debug-metrics dt { color:#667365; } .debug-metrics dd { margin:0; text-align:right; } .map-tooltip { position:absolute; pointer-events:none; padding:.45rem .65rem; border-radius:.5rem; background:#18261ddd; color:white; font-size:.8rem; transform:translate(12px,12px); }
+@media (max-width: 800px) { .shell { grid-template-columns:1fr; grid-template-rows:auto minmax(0,1fr); padding:.65rem; gap:.65rem; } .sidebar { max-height:40vh; } .page-switcher { padding:.65rem; } .menu { padding:.65rem; } }
+
+/* Canvas markers are drawn by Swift. These rules keep their click/hover affordances and
+   multi-container loot tooltips visible above both canvases. */
+.map-frame { cursor: grab; }
+.map-frame.dragging { cursor: grabbing; }
+.map-frame:focus-visible { outline: 3px solid #7ca66b; outline-offset: 3px; }
+#map-overlay { cursor: inherit; }
+.structure-help { margin: 0; color: #667365; font-size: .82rem; line-height: 1.4; }
+.loot-list { display: grid; gap: .6rem; }
+.loot-container { border: 1px solid var(--line); border-radius: .7rem; background: #fffdf7; overflow: hidden; }
+.loot-container summary { padding: .7rem .8rem; background: #f0eee4; font: .8rem ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+.loot-items { margin: 0; padding: .7rem 1rem .8rem 2.2rem; display: grid; gap: .25rem; font: .82rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+.map-tooltip {
+  z-index: 10;
+  max-width: min(24rem, calc(100% - 1.5rem));
+  max-height: calc(100% - 1.5rem);
+  overflow: auto;
+  padding: .55rem .7rem;
+  border: 1px solid #ffffff80;
+  background: #101810f2;
+  box-shadow: 0 .6rem 1.4rem #0006;
+  font: .8rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-line;
+}

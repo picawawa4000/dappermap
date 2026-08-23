@@ -1,0 +1,22 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+Package.resolved
+.vscode/
+# Vanilla data packs.
+# Download the vanilla data packs into Data/<version> (currently only 1.21.11 is supported).
+# Use Scripts/generate_default_datapack_bundle.py to get the compressed data pack.
+Data/
+Web/
+# Swift stuff
+.dappermap
+.swiftpm-cache
+.swiftpm-config
+.swiftpm-scratch
+.swiftpm-sdks
+.swiftpm-security
