@@ -73,6 +73,29 @@ private struct CachedTile: Sendable {
     let height: Int
     let palette: [String]
     let biomeIndices: [UInt16]
+    let structurePoints: [StructurePoint]
+    let structureMetrics: StructureProfilingMetrics
+}
+
+private struct TileBiomeCache: Sendable {
+    let startX: Int32
+    let startZ: Int32
+    let scale: Int32
+    let width: Int
+    let height: Int
+    let biomeIDs: [String]
+
+    var usableMinX: Int32 { startX &+ 32 }
+    var usableMaxX: Int32 { startX &+ (Int32(width) &- 1) &* scale &- 32 }
+    var usableMinZ: Int32 { startZ &+ 32 }
+    var usableMaxZ: Int32 { startZ &+ (Int32(height) &- 1) &* scale &- 32 }
+
+    func biome(at position: PosInt3D) -> RegistryKey<Biome>? {
+        let x = floorDivide(position.x &- startX, by: scale)
+        let z = floorDivide(position.z &- startZ, by: scale)
+        guard x >= 0, z >= 0, x < Int32(width), z < Int32(height) else { return nil }
+        return RegistryKey(referencing: biomeIDs[Int(z) * width + Int(x)])
+    }
 }
 
 private struct TileAtlas {
@@ -124,6 +147,47 @@ private struct StructureQuery: Sendable {
     let minimumSpacingBlocks: Double
 }
 
+private struct StructureProfilingMetrics: Sendable {
+    var totalMilliseconds = 0.0
+    var samplingMilliseconds = 0.0
+    var validationMilliseconds = 0.0
+    var candidates = 0
+    var accepted = 0
+    var rejected = 0
+    var cacheHits = 0
+    var byStructureType: [String: StructureTypeProfilingMetrics] = [:]
+
+    mutating func merge(_ other: Self) {
+        totalMilliseconds += other.totalMilliseconds
+        samplingMilliseconds += other.samplingMilliseconds
+        validationMilliseconds += other.validationMilliseconds
+        candidates += other.candidates
+        accepted += other.accepted
+        rejected += other.rejected
+        cacheHits += other.cacheHits
+        for (structureID, otherMetrics) in other.byStructureType {
+            var metrics = byStructureType[structureID, default: StructureTypeProfilingMetrics()]
+            metrics.starts += otherMetrics.starts
+            metrics.totalMilliseconds += otherMetrics.totalMilliseconds
+            byStructureType[structureID] = metrics
+        }
+    }
+}
+
+private struct StructureTypeProfilingMetrics: Sendable {
+    var starts = 0
+    var totalMilliseconds = 0.0
+
+    var averageMilliseconds: Double {
+        starts == 0 ? 0.0 : totalMilliseconds / Double(starts)
+    }
+}
+
+private struct StructureQueryResult: Sendable {
+    let points: [StructurePoint]
+    let metrics: StructureProfilingMetrics
+}
+
 private enum StructurePlacementKind: String, Decodable, Sendable {
     case randomSpread = "minecraft:random_spread"
     case concentricRings = "minecraft:concentric_rings"
@@ -133,6 +197,7 @@ private struct StructureSetDescriptor: Sendable {
     let keyName: String
     let kind: StructurePlacementKind
     let spacing: Int32?
+    let frequency: Double?
     let structureIDs: [String]
 }
 
@@ -148,6 +213,7 @@ private struct EncodedWeightedStructure: Decodable {
 private struct EncodedStructurePlacement: Decodable {
     let type: StructurePlacementKind
     let spacing: Int32?
+    let frequency: Double?
 }
 
 private struct EncodedStructureDefinition: Decodable {
@@ -528,7 +594,6 @@ enum DapperMapMain {
         Task {
             do {
                 let tileExecutor = try await WebWorkerDedicatedExecutor()
-                let structureExecutor = try await WebWorkerDedicatedExecutor()
                 let samplingBackend = await MainActor.run {
                     webKitNeedsScalarTileSampling() ? TileSamplingBackend.scalar : .nestedWASM
                 }
@@ -536,17 +601,9 @@ enum DapperMapMain {
                     serialExecutor: .dedicated(tileExecutor),
                     samplingBackend: samplingBackend
                 )
-                let structureGenerator = TileGenerationService(
-                    serialExecutor: .dedicated(structureExecutor),
-                    // Loot generation can be computationally expensive, but does not need the
-                    // nested browser-WASM sampler used for tiles. Keeping it scalar prevents a
-                    // click-driven task from invoking JavaScript host functions off the worker.
-                    samplingBackend: .scalar
-                )
                 await MainActor.run {
                     let browserApp = BrowserApp(
-                        tileGenerator: tileGenerator,
-                        structureGenerator: structureGenerator
+                        tileGenerator: tileGenerator
                     )
                     app = browserApp
                     browserApp.start()
@@ -605,6 +662,9 @@ private actor TileGenerationService {
     private var samplers: [TileSamplerKey: CompiledNoiseRouterBiomeBulkSampler] = [:]
     private var structureSampler: StructurePlacementSampler?
     private var structureSetDescriptors: [StructureSetDescriptor] = []
+    private var validatedStructureStarts: [String: String] = [:]
+    private var rejectedStructureStarts: Set<String> = []
+    private var structureHeightmapSampler: GeneratedStructureHeightmapSampler?
     private var dataPackRoot: URL?
     nonisolated var unownedExecutor: UnownedSerialExecutor {
         serialExecutor.unownedExecutor
@@ -645,6 +705,7 @@ private actor TileGenerationService {
                 keyName: entry.key.name,
                 kind: encoded.placement.type,
                 spacing: encoded.placement.spacing,
+                frequency: encoded.placement.frequency,
                 structureIDs: encoded.structures.map(\.structure)
             )
         }
@@ -658,11 +719,32 @@ private actor TileGenerationService {
         try configureGenerator(for: job.seed, using: dataPack)
 
         let start = Date()
-        let tile = try makeTile(
+        let generated = try makeTile(
             using: generator!,
             blocksPerPixel: job.tileBlocksPerPixel,
             tileX: job.tileX,
             tileZ: job.tileZ
+        )
+        let structureQuery = StructureQuery(
+            seed: job.seed,
+            minX: generated.biomeCache.usableMinX,
+            maxX: generated.biomeCache.usableMaxX,
+            minZ: generated.biomeCache.usableMinZ,
+            maxZ: generated.biomeCache.usableMaxZ,
+            enabledStructureSets: Set(structureSetDescriptors.map(\.keyName)),
+            minimumSpacingBlocks: Double(tileSize) * job.tileBlocksPerPixel / 8.0
+        )
+        let structures = try structures(
+            in: structureQuery,
+            biomeSampler: generated.biomeCache.biome(at:)
+        )
+        let tile = CachedTile(
+            width: generated.tile.width,
+            height: generated.tile.height,
+            palette: generated.tile.palette,
+            biomeIndices: generated.tile.biomeIndices,
+            structurePoints: structures?.points ?? [],
+            structureMetrics: structures?.metrics ?? StructureProfilingMetrics()
         )
         return GeneratedTile(
             tile: tile,
@@ -670,12 +752,27 @@ private actor TileGenerationService {
         )
     }
 
-    func structures(in query: StructureQuery) throws -> [StructurePoint] {
+    // Structure starts are generated as part of a tile after its biome cache exists. Keep the
+    // former viewport-wide entry point unavailable so callers cannot bypass that cache.
+    func structures(in query: StructureQuery) throws -> StructureQueryResult? {
+        throw BrowserAppError.message("Structure starts must be generated as part of a tile.")
+    }
+
+    func structures(
+        in query: StructureQuery,
+        biomeSampler: @escaping (PosInt3D) throws -> RegistryKey<Biome>?
+    ) throws -> StructureQueryResult? {
+        let profilingStart = Date()
+        var metrics = StructureProfilingMetrics()
         guard let dataPack else {
             throw BrowserAppError.message("Tile generation worker is not ready.")
         }
         try configureGenerator(for: query.seed, using: dataPack)
-        guard let generator, let structureSampler else { return [] }
+        guard let generator, let structureSampler else { return nil }
+        let validationContext = try makeValidationContext(
+            using: generator,
+            biomeSampler: biomeSampler
+        )
 
         var points = Set<StructurePoint>()
         for descriptor in structureSetDescriptors where query.enabledStructureSets.contains(descriptor.keyName) {
@@ -683,7 +780,11 @@ private actor TileGenerationService {
             switch descriptor.kind {
             case .randomSpread:
                 guard let spacing = descriptor.spacing, spacing > 0 else { continue }
-                guard Double(spacing) * 16.0 >= query.minimumSpacingBlocks else { continue }
+                // A frequency-based set can have a small spacing but still be intentionally
+                // sparse. Do not hide it at coarse zoom levels based on spacing alone.
+                if descriptor.frequency == nil {
+                    guard Double(spacing) * 16.0 >= query.minimumSpacingBlocks else { continue }
+                }
                 var minRegionX = floorDivide(query.minX, by: spacing * 16) - 1
                 var maxRegionX = floorDivide(query.maxX, by: spacing * 16) + 1
                 var minRegionZ = floorDivide(query.minZ, by: spacing * 16) - 1
@@ -702,6 +803,7 @@ private actor TileGenerationService {
                     maxRegionZ = centerRegionZ + 15
                 }
                 var generated: [StructurePlacementSample] = []
+                let samplingStart = Date()
                 for regionZ in minRegionZ...maxRegionZ {
                     for regionX in minRegionX...maxRegionX {
                         if let sample = try structureSampler.sampleStructureSet(
@@ -709,73 +811,166 @@ private actor TileGenerationService {
                             for: RegistryKey(referencing: descriptor.keyName)
                         ) {
                             generated.append(sample)
+                            metrics.candidates += 1
                         }
                     }
                 }
+                metrics.samplingMilliseconds += Date().timeIntervalSince(samplingStart) * 1_000.0
                 samples = generated
             case .concentricRings:
-                continue
+                // Concentric-ring placements are generated in the same tile pass as random
+                // spread placements so strongholds are retained in the tile cache and use the
+                // already-generated biome sampler for validation.
+                let samplingStart = Date()
+                samples = try structureSampler.sampleAllPlacements(
+                    for: RegistryKey(referencing: descriptor.keyName)
+                )
+                metrics.samplingMilliseconds += Date().timeIntervalSince(samplingStart) * 1_000.0
+                metrics.candidates += samples.count
             }
 
+            let validationStart = Date()
             for sample in samples where pointIsVisible(sample.blockPos, in: query) {
-                let biome = try generator.sampleBiome(
-                    at: PosInt3D(
+                // Monument validation scans a 59×59×59 biome volume. Most random-spread
+                // candidates are not even in a deep ocean, so reject those before asking the
+                // placement sampler to perform its authoritative surrounding-ocean check.
+                if descriptor.keyName == "minecraft:ocean_monuments" {
+                    let biome = try biomeSampler(PosInt3D(
                         x: sample.chunkPos.x &* 16 &+ 8,
-                        y: 256,
+                        y: 63,
                         z: sample.chunkPos.z &* 16 &+ 8
-                    ),
-                    in: overworldDimension
-                )
-                guard let biome, let structure = try structureSampler.resolveStructure(for: sample, biome: biome) else {
+                    ))
+                    guard let biome,
+                          try structureSampler.resolveStructure(for: sample, biome: biome) != nil
+                    else { continue }
+                }
+                let validationKey = "\(descriptor.keyName):\(sample.chunkPos.x),\(sample.chunkPos.z)"
+                let structureID: String
+                if let cached = validatedStructureStarts[validationKey] {
+                    metrics.cacheHits += 1
+                    structureID = cached
+                } else if rejectedStructureStarts.contains(validationKey) {
+                    metrics.cacheHits += 1
+                    metrics.rejected += 1
                     continue
+                } else {
+                    let startValidationStart = Date()
+                    let resolvedStructure = try structureSampler.resolveStructure(
+                        for: sample,
+                        validatingWith: validationContext
+                    )
+                    let startValidationMilliseconds = Date().timeIntervalSince(startValidationStart) * 1_000.0
+                    let profiledStructureIDs = resolvedStructure.map { [$0.name] } ?? descriptor.structureIDs
+                    for structureID in profiledStructureIDs {
+                        var typeMetrics = metrics.byStructureType[structureID, default: StructureTypeProfilingMetrics()]
+                        typeMetrics.starts += 1
+                        typeMetrics.totalMilliseconds += startValidationMilliseconds
+                        metrics.byStructureType[structureID] = typeMetrics
+                    }
+                    guard let structure = resolvedStructure else {
+                        rejectedStructureStarts.insert(validationKey)
+                        metrics.rejected += 1
+                        continue
+                    }
+                    structureID = structure.name
+                    validatedStructureStarts[validationKey] = structureID
+                    metrics.accepted += 1
                 }
                 points.insert(StructurePoint(
                     setID: descriptor.keyName,
-                    structureID: structure.name,
+                    structureID: structureID,
                     x: sample.blockPos.x,
                     z: sample.blockPos.z
                 ))
             }
+            metrics.validationMilliseconds += Date().timeIntervalSince(validationStart) * 1_000.0
         }
-        return points.sorted { ($0.z, $0.x, $0.setID, $0.structureID) < ($1.z, $1.x, $1.setID, $1.structureID) }
+        metrics.totalMilliseconds = Date().timeIntervalSince(profilingStart) * 1_000.0
+        return StructureQueryResult(
+            points: points.sorted { ($0.z, $0.x, $0.setID, $0.structureID) < ($1.z, $1.x, $1.setID, $1.structureID) },
+            metrics: metrics
+        )
     }
 
     /// Ring placements are deliberately a second pass: DPReader enumerates all rings before it
     /// returns any stronghold, which should not hold up the normal map and random-spread overlay.
-    func concentricStructures(in query: StructureQuery) throws -> [StructurePoint] {
+    func concentricStructures(in query: StructureQuery) throws -> StructureQueryResult? {
+        throw BrowserAppError.message("Structure starts must be generated as part of a tile.")
+    }
+
+    func concentricStructures(
+        in query: StructureQuery,
+        biomeSampler: @escaping (PosInt3D) throws -> RegistryKey<Biome>?
+    ) throws -> StructureQueryResult? {
+        let profilingStart = Date()
+        var metrics = StructureProfilingMetrics()
         guard let dataPack else {
             throw BrowserAppError.message("Tile generation worker is not ready.")
         }
         try configureGenerator(for: query.seed, using: dataPack)
-        guard let generator, let structureSampler else { return [] }
+        guard let generator, let structureSampler else { return nil }
+        let validationContext = try makeValidationContext(
+            using: generator,
+            biomeSampler: biomeSampler
+        )
 
         var points = Set<StructurePoint>()
         for descriptor in structureSetDescriptors
         where descriptor.kind == .concentricRings && query.enabledStructureSets.contains(descriptor.keyName) {
+            let samplingStart = Date()
             let samples = try structureSampler.sampleAllPlacements(
                 for: RegistryKey(referencing: descriptor.keyName)
             )
+            metrics.samplingMilliseconds += Date().timeIntervalSince(samplingStart) * 1_000.0
+            metrics.candidates += samples.count
+            let validationStart = Date()
             for sample in samples where pointIsVisible(sample.blockPos, in: query) {
-                let biome = try generator.sampleBiome(
-                    at: PosInt3D(
-                        x: sample.chunkPos.x &* 16 &+ 8,
-                        y: 256,
-                        z: sample.chunkPos.z &* 16 &+ 8
-                    ),
-                    in: overworldDimension
-                )
-                guard let biome, let structure = try structureSampler.resolveStructure(for: sample, biome: biome) else {
+                let validationKey = "\(descriptor.keyName):\(sample.chunkPos.x),\(sample.chunkPos.z)"
+                let structureID: String
+                if let cached = validatedStructureStarts[validationKey] {
+                    metrics.cacheHits += 1
+                    structureID = cached
+                } else if rejectedStructureStarts.contains(validationKey) {
+                    metrics.cacheHits += 1
+                    metrics.rejected += 1
                     continue
+                } else {
+                    let startValidationStart = Date()
+                    let resolvedStructure = try structureSampler.resolveStructure(
+                        for: sample,
+                        validatingWith: validationContext
+                    )
+                    let startValidationMilliseconds = Date().timeIntervalSince(startValidationStart) * 1_000.0
+                    let profiledStructureIDs = resolvedStructure.map { [$0.name] } ?? descriptor.structureIDs
+                    for structureID in profiledStructureIDs {
+                        var typeMetrics = metrics.byStructureType[structureID, default: StructureTypeProfilingMetrics()]
+                        typeMetrics.starts += 1
+                        typeMetrics.totalMilliseconds += startValidationMilliseconds
+                        metrics.byStructureType[structureID] = typeMetrics
+                    }
+                    guard let structure = resolvedStructure else {
+                        rejectedStructureStarts.insert(validationKey)
+                        metrics.rejected += 1
+                        continue
+                    }
+                    structureID = structure.name
+                    validatedStructureStarts[validationKey] = structureID
+                    metrics.accepted += 1
                 }
                 points.insert(StructurePoint(
                     setID: descriptor.keyName,
-                    structureID: structure.name,
+                    structureID: structureID,
                     x: sample.blockPos.x,
                     z: sample.blockPos.z
                 ))
             }
+            metrics.validationMilliseconds += Date().timeIntervalSince(validationStart) * 1_000.0
         }
-        return points.sorted { ($0.z, $0.x, $0.setID, $0.structureID) < ($1.z, $1.x, $1.setID, $1.structureID) }
+        metrics.totalMilliseconds = Date().timeIntervalSince(profilingStart) * 1_000.0
+        return StructureQueryResult(
+            points: points.sorted { ($0.z, $0.x, $0.setID, $0.structureID) < ($1.z, $1.x, $1.setID, $1.structureID) },
+            metrics: metrics
+        )
     }
 
     func loot(for structure: StructurePoint, seed: WorldSeed) throws -> [LootContainerPoint] {
@@ -805,22 +1000,31 @@ private actor TileGenerationService {
             break
         }
 
-        if !terrainChunkCoordinates.isEmpty {
+        let needsGeneratedTerrain = encodedDefinition.type == "minecraft:jigsaw"
+            || encodedDefinition.type == "minecraft:buried_treasure"
+            || !terrainChunkCoordinates.isEmpty
+        let terrainGenerator: WorldGenerator?
+        if needsGeneratedTerrain {
             try configureGenerator(for: seed, using: dataPack)
             guard let generator else {
                 throw BrowserAppError.message("Structure generation worker is not ready.")
             }
+            terrainGenerator = generator
+        } else {
+            terrainGenerator = nil
+        }
+        if !terrainChunkCoordinates.isEmpty, let terrainGenerator {
             for coordinate in terrainChunkCoordinates {
                 let values = coordinate.split(separator: ",", maxSplits: 1).compactMap { Int32($0) }
                 guard values.count == 2 else { continue }
                 let chunk = ProtoChunk()
-                try generator.generateInto(chunk, at: PosInt2D(x: values[0], z: values[1]))
+                try terrainGenerator.generateInto(chunk, at: PosInt2D(x: values[0], z: values[1]))
                 terrainChunks[coordinate] = chunk
             }
         }
 
-        let air = BlockState(type: Block(withID: "minecraft:air"))
-        let terrain = BlockState(type: Block(withID: "minecraft:stone"))
+        let air = BlockState(id: "minecraft:air")
+        let terrain = BlockState(id: "minecraft:stone")
         let context = StructureGenerationContext(
             seaLevel: 63,
             minimumWorldY: -64,
@@ -828,7 +1032,13 @@ private actor TileGenerationService {
             blockSampler: { position in
                 let chunkX = floorDivide(position.x, by: 16)
                 let chunkZ = floorDivide(position.z, by: 16)
-                guard let chunk = terrainChunks["\(chunkX),\(chunkZ)"],
+                let coordinate = "\(chunkX),\(chunkZ)"
+                if terrainChunks[coordinate] == nil, let terrainGenerator {
+                    let chunk = ProtoChunk()
+                    try? terrainGenerator.generateInto(chunk, at: PosInt2D(x: chunkX, z: chunkZ))
+                    terrainChunks[coordinate] = chunk
+                }
+                guard let chunk = terrainChunks[coordinate],
                       position.y >= chunk.minY,
                       position.y < chunk.minY + chunk.height else {
                     return air
@@ -838,7 +1048,7 @@ private actor TileGenerationService {
                     y: position.y - chunk.minY,
                     z: position.z - chunkZ * 16
                 )
-                return chunk.isTerrain(atLocal: localPosition) ? terrain : air
+                return chunk.block(atLocal: localPosition)
             }
         )
         // The map intentionally shows biome-valid placement candidates. Mansion layouts need a
@@ -847,7 +1057,7 @@ private actor TileGenerationService {
         // anchor so candidate loot remains deterministic and matches DPReader's layout.
         let lootContext: StructureGenerationContext
         if encodedDefinition.type == "minecraft:woodland_mansion" {
-            let mansionTerrain = BlockState(type: Block(withID: "minecraft:stone"))
+            let mansionTerrain = BlockState(id: "minecraft:stone")
             lootContext = StructureGenerationContext(
                 seaLevel: 63,
                 minimumWorldY: -64,
@@ -901,29 +1111,93 @@ private actor TileGenerationService {
         rootURL: URL,
         enchantmentResources: LootEnchantmentResources
     ) throws -> [String] {
-        let parts = tableID.split(separator: ":", maxSplits: 1)
-        let namespace = parts.count == 2 ? String(parts[0]) : "minecraft"
-        let path = parts.count == 2 ? String(parts[1]) : tableID
-        let tableURL = rootURL.appendingPathComponent("data/\(namespace)/loot_table/\(path).json")
-        let table = try JSONDecoder().decode(LootTable.self, from: Data(contentsOf: tableURL))
+        func loadLootTable(_ identifier: String) throws -> LootTable {
+            let parts = identifier.split(separator: ":", maxSplits: 1)
+            let namespace = parts.count == 2 ? String(parts[0]) : "minecraft"
+            let path = parts.count == 2 ? String(parts[1]) : identifier
+            let tableURL = rootURL.appendingPathComponent("data/\(namespace)/loot_table/\(path).json")
+            return try JSONDecoder().decode(LootTable.self, from: Data(contentsOf: tableURL))
+        }
+
+        let table = try loadLootTable(tableID)
         let items = try table.generateLoot(withContext: LootContext(
             random: CheckedRandom(seed: UInt64(bitPattern: seed)),
             enchantmentResources: enchantmentResources
-        ))
-        var itemOrder: [String] = []
-        var itemCounts: [String: Int] = [:]
+        ), resolvingTables: { identifier in
+            try loadLootTable(identifier)
+        })
+        func titleCaseID(_ identifier: String) -> String {
+            let path = identifier.split(separator: ":", maxSplits: 1).last.map(String.init) ?? identifier
+            return path.split(separator: "_").map { part in
+                guard let first = part.first else { return "" }
+                return String(first).uppercased() + part.dropFirst()
+            }.joined(separator: " ")
+        }
+
+        func stringValue(_ value: JSONValue?) -> String? {
+            guard case .string(let value)? = value else { return nil }
+            return value
+        }
+
+        func integerValue(_ value: JSONValue?) -> Int64? {
+            guard case .integer(let value)? = value else { return nil }
+            return value
+        }
+
+        func metadata(for item: ItemStack) -> [String] {
+            let reflected = Dictionary(uniqueKeysWithValues: Mirror(reflecting: item).children.compactMap { child in
+                child.label.map { ($0, child.value) }
+            })
+            guard let components = reflected["components"] as? [String: JSONValue] else { return [] }
+            var metadata: [String] = []
+
+            if case .object(let enchantmentComponent)? = components["minecraft:enchantments"],
+               case .object(let levels)? = enchantmentComponent["levels"] {
+                let enchantments = levels.compactMap { id, value -> String? in
+                    guard let level = integerValue(value) else { return nil }
+                    return "\(titleCaseID(id)) \(level)"
+                }.sorted()
+                if !enchantments.isEmpty {
+                    metadata.append("Enchantments: " + enchantments.joined(separator: ", "))
+                }
+            }
+
+            if case .object(let potionComponent)? = components["minecraft:potion_contents"],
+               let potion = stringValue(potionComponent["potion"]) {
+                metadata.append("Potion: \(titleCaseID(potion))")
+            }
+
+            if case .array(let effects)? = components["minecraft:suspicious_stew_effects"] {
+                let descriptions = effects.compactMap { effect -> String? in
+                    guard case .object(let values) = effect,
+                          let id = stringValue(values["id"]) else { return nil }
+                    if let duration = integerValue(values["duration"]) {
+                        return "\(titleCaseID(id)) (\(duration) ticks)"
+                    }
+                    return titleCaseID(id)
+                }
+                if !descriptions.isEmpty {
+                    metadata.append("Effects: " + descriptions.joined(separator: ", "))
+                }
+            }
+            return metadata
+        }
+
+        var formattedItems: [String] = []
         for item in items {
             let fields = Dictionary(uniqueKeysWithValues: Mirror(reflecting: item).children.compactMap { child in
                 child.label.map { ($0, String(describing: child.value)) }
             })
             let name = fields["itemName"] ?? "unknown"
             let count = Int(fields["count"] ?? "") ?? 0
-            if itemCounts[name] == nil {
-                itemOrder.append(name)
-            }
-            itemCounts[name, default: 0] += count
+            let suffix = metadata(for: item)
+            formattedItems.append(
+                suffix.isEmpty
+                    ? "\(count) × \(name)"
+                    : "\(count) × \(name) — " + suffix.joined(separator: "; ")
+            )
         }
-        return itemOrder.map { "\(itemCounts[$0, default: 0]) × \($0)" }
+        return formattedItems
     }
 
     private func configureGenerator(for seed: WorldSeed, using dataPack: DataPack) throws {
@@ -957,6 +1231,9 @@ private actor TileGenerationService {
             currentSeed = seed
             samplers.removeAll(keepingCapacity: true)
             structureSampler = StructurePlacementSampler(withWorldSeed: seed, usingDataPacks: [dataPack])
+            validatedStructureStarts.removeAll(keepingCapacity: true)
+            rejectedStructureStarts.removeAll(keepingCapacity: true)
+            structureHeightmapSampler = nil
         }
     }
 
@@ -965,12 +1242,39 @@ private actor TileGenerationService {
             && point.z >= query.minZ && point.z <= query.maxZ
     }
 
+    private func makeValidationContext(
+        using generator: WorldGenerator,
+        biomeSampler: @escaping (PosInt3D) throws -> RegistryKey<Biome>?
+    ) throws -> StructureStartValidationContext {
+        let terrain: GeneratedStructureHeightmapSampler
+        if let existing = structureHeightmapSampler {
+            terrain = existing
+        } else {
+            terrain = GeneratedStructureHeightmapSampler(
+                worldGenerator: generator,
+                seaLevel: 63,
+                minimumWorldY: -64,
+                maximumWorldY: 319,
+                dimension: overworldDimension
+            )
+            structureHeightmapSampler = terrain
+        }
+        return StructureStartValidationContext(
+            dimension: overworldDimension,
+            seaLevel: 63,
+            minimumWorldY: -64,
+            maximumWorldY: 319,
+            heightmapSampler: terrain.height,
+            biomeSampler: biomeSampler
+        )
+    }
+
     private func makeTile(
         using generator: WorldGenerator,
         blocksPerPixel: Double,
         tileX: Int,
         tileZ: Int
-    ) throws -> CachedTile {
+    ) throws -> (tile: CachedTile, biomeCache: TileBiomeCache) {
         let pixelsPerSample = max(1, Int((1.0 / blocksPerPixel).rounded()))
         let sampleScale = max(1, Int32(blocksPerPixel.rounded()))
         let sampleWidth = tileSize / pixelsPerSample
@@ -1003,8 +1307,7 @@ private actor TileGenerationService {
                 to: PosInt2D(x: startX + extent, z: startZ + extent),
                 atY: sampleY,
                 in: overworldDimension,
-                scale: sampleScale,
-                forceNoBaking: true
+                scale: sampleScale
             ) else {
                 throw BrowserAppError.message("The overworld biome sampler returned no data.")
             }
@@ -1025,7 +1328,74 @@ private actor TileGenerationService {
             }
             indices[index] = paletteIndex
         }
-        return CachedTile(width: sampleWidth, height: sampleWidth, palette: palette, biomeIndices: indices)
+
+        // Structure validation is quart-aligned and may inspect a 29-block radius around an
+        // ocean monument. Generate a padded quart grid in the same biome pass so validation can
+        // read the results without asking WorldGenerator to sample individual positions again.
+        let structureScale: Int32 = 4
+        let structureSampleY: Int32 = 63
+        let structureMargin: Int32 = 32
+        let tileSpan = Int32((Double(tileSize) * blocksPerPixel).rounded())
+        let sampledStructureSpan = min(tileSpan, Int32(4096))
+        let sampledStructureOriginX = startX &+ (tileSpan &- sampledStructureSpan) / 2
+        let sampledStructureOriginZ = startZ &+ (tileSpan &- sampledStructureSpan) / 2
+        let structureStartX = floorDivide(sampledStructureOriginX &- structureMargin, by: structureScale) * structureScale
+        let structureStartZ = floorDivide(sampledStructureOriginZ &- structureMargin, by: structureScale) * structureScale
+        let structureEndX = sampledStructureOriginX &+ sampledStructureSpan &+ structureMargin
+        let structureEndZ = sampledStructureOriginZ &+ sampledStructureSpan &+ structureMargin
+        let structureWidth = Int(floorDivide(structureEndX &- structureStartX &+ structureScale &- 1, by: structureScale))
+        let structureHeight = Int(floorDivide(structureEndZ &- structureStartZ &+ structureScale &- 1, by: structureScale))
+        let structureBiomeIDs: [String]
+        switch samplingBackend {
+        case .nestedWASM:
+            let key = TileSamplerKey(sampleWidth: Int32(structureWidth), sampleScale: structureScale)
+            let sampler: CompiledNoiseRouterBiomeBulkSampler
+            if let existing = samplers[key] {
+                sampler = existing
+            } else {
+                sampler = try generator.makeBiomeIDBulkSampler(
+                    for: CompiledDensityFunctionBufferContext(
+                        xCount: Int32(structureWidth), yCount: 1, zCount: Int32(structureHeight),
+                        xStep: structureScale, yStep: 1, zStep: structureScale
+                    ),
+                    in: overworldDimension,
+                    strategy: .wasm
+                )
+                samplers[key] = sampler
+            }
+            let volume = sampler(at: PosInt3D(x: structureStartX, y: structureSampleY, z: structureStartZ))
+            structureBiomeIDs = volume.biomeIDs.map { volume.palette[Int($0)].name }
+        case .scalar:
+            let structureExtentX = Int32(structureWidth) * structureScale
+            let structureExtentZ = Int32(structureHeight) * structureScale
+            guard let biomes = try generator.generateBiomesInSquare(
+                from: PosInt2D(x: structureStartX, z: structureStartZ),
+                to: PosInt2D(x: structureStartX &+ structureExtentX, z: structureStartZ &+ structureExtentZ),
+                atY: structureSampleY,
+                in: overworldDimension,
+                scale: structureScale
+            ) else {
+                throw BrowserAppError.message("The overworld structure biome sampler returned no data.")
+            }
+            structureBiomeIDs = biomes.map(\.name)
+        }
+        let biomeCache = TileBiomeCache(
+            startX: structureStartX,
+            startZ: structureStartZ,
+            scale: structureScale,
+            width: structureWidth,
+            height: structureHeight,
+            biomeIDs: structureBiomeIDs
+        )
+        let tile = CachedTile(
+            width: sampleWidth,
+            height: sampleWidth,
+            palette: palette,
+            biomeIndices: indices,
+            structurePoints: [],
+            structureMetrics: StructureProfilingMetrics()
+        )
+        return (tile, biomeCache)
     }
 
     private func materialize(bundle: DatapackBundle) throws -> URL {
@@ -1080,6 +1450,14 @@ private final class BrowserApp {
     private let debugRenderTimeElement: JSObject
     private let debugPendingTilesElement: JSObject
     private let debugCachedTilesElement: JSObject
+    private let debugStructureTimeElement: JSObject
+    private let debugStructureSamplingElement: JSObject
+    private let debugStructureValidationElement: JSObject
+    private let debugStructureCandidatesElement: JSObject
+    private let debugStructureAcceptedElement: JSObject
+    private let debugStructureRejectedElement: JSObject
+    private let debugStructureCacheHitsElement: JSObject
+    private let debugStructureTypesElement: JSObject
     private let tooltipElement: JSObject
     private let canvas: JSObject
     private let context: JSObject
@@ -1095,15 +1473,15 @@ private final class BrowserApp {
     private var dataPack: DataPack?
     private var currentSeed: WorldSeed?
     private let tileGenerator: TileGenerationService
-    private let structureGenerator: TileGenerationService
+    private var inFlightStructureTask: Task<Void, Never>?
+    private var inFlightConcentricStructureTask: Task<Void, Never>?
+    private var requestedStructureGeneration: Int?
     private var inFlightTileJob: PendingTileJob?
     private var inFlightTileTask: Task<Void, Never>?
     private var pendingRenderTimer: JSTimer?
     private var pendingTileTimer: JSTimer?
     private var latestViewState: ViewState?
     private var tileCache: [TileCacheKey: CachedTile] = [:]
-    private var tileRasterCache: [TileCacheKey: JSObject] = [:]
-    private var tileCanvasCache: [TileCacheKey: JSObject] = [:]
     private var tileAtlas: TileAtlas?
     private var fallbackTileAtlas: TileAtlas?
     private var pendingTileJobs: [PendingTileJob] = []
@@ -1111,6 +1489,7 @@ private final class BrowserApp {
     private var profilingEnabled = false
     private var profilingMetrics = TileProfilingMetrics()
     private var tileDebugMetrics = TileDebugMetrics()
+    private var structureDebugMetrics = StructureProfilingMetrics()
     private var biomeColors: [String: BiomeColor] = [:]
     private var biomeColorCache: [String: String] = [:]
     private var biomeRowElements: [String: BiomeRowElements] = [:]
@@ -1118,6 +1497,7 @@ private final class BrowserApp {
     private var structureColors: [String: BiomeColor] = [:]
     private var enabledStructureSets: [String: Bool] = [:]
     private var structureSetSpacings: [String: Int32] = [:]
+    private var structureSetFrequencies: Set<String> = []
     private var structureRowElements: [String: StructureRowElements] = [:]
     private var loadedStructureIDs: [String] = []
     private var visibleStructurePoints: [StructurePoint] = []
@@ -1126,9 +1506,6 @@ private final class BrowserApp {
     private var activeLootRequest = 0
     private var lootContainerDetails: [LootContainerPoint: JSObject] = [:]
     private var inFlightLootTask: Task<Void, Never>?
-    private var inFlightStructureTask: Task<Void, Never>?
-    private var inFlightConcentricStructureTask: Task<Void, Never>?
-    private var requestedStructureGeneration: Int?
     private var viewCenterX = 0.0
     private var viewCenterZ = 0.0
     private var viewBlocksPerPixel = 1.0
@@ -1148,9 +1525,8 @@ private final class BrowserApp {
     private let gridLineColor = "rgba(29, 41, 29, 0.18)"
     private let gridLabelColor = "rgba(29, 41, 29, 0.72)"
 
-    init(tileGenerator: TileGenerationService, structureGenerator: TileGenerationService) {
+    init(tileGenerator: TileGenerationService) {
         self.tileGenerator = tileGenerator
-        self.structureGenerator = structureGenerator
         self.document = JSObject.global.document.object!
         self.viewport = document.getElementById!("map-viewport").object!
         self.seedInput = document.getElementById!("seed-input").object!
@@ -1176,6 +1552,14 @@ private final class BrowserApp {
         self.debugRenderTimeElement = document.getElementById!("debug-render-time").object!
         self.debugPendingTilesElement = document.getElementById!("debug-pending-tiles").object!
         self.debugCachedTilesElement = document.getElementById!("debug-cached-tiles").object!
+        self.debugStructureTimeElement = document.getElementById!("debug-structure-time").object!
+        self.debugStructureSamplingElement = document.getElementById!("debug-structure-sampling").object!
+        self.debugStructureValidationElement = document.getElementById!("debug-structure-validation").object!
+        self.debugStructureCandidatesElement = document.getElementById!("debug-structure-candidates").object!
+        self.debugStructureAcceptedElement = document.getElementById!("debug-structure-accepted").object!
+        self.debugStructureRejectedElement = document.getElementById!("debug-structure-rejected").object!
+        self.debugStructureCacheHitsElement = document.getElementById!("debug-structure-cache-hits").object!
+        self.debugStructureTypesElement = document.getElementById!("debug-structure-types").object!
         self.tooltipElement = document.getElementById!("map-tooltip").object!
         self.canvas = document.getElementById!("map-canvas").object!
         self.context = canvas.getContext!("2d").object!
@@ -1231,6 +1615,7 @@ private final class BrowserApp {
 
         let key = TileCacheKey(seed: seed, scaleKey: scaleKey(for: job.tileBlocksPerPixel), tileX: job.tileX, tileZ: job.tileZ)
         tileCache[key] = result.tile
+        refreshVisibleStructures(for: currentViewState())
         tileDebugMetrics.tileX = job.tileX
         tileDebugMetrics.tileZ = job.tileZ
         tileDebugMetrics.blocksPerPixel = job.tileBlocksPerPixel
@@ -1480,10 +1865,7 @@ private final class BrowserApp {
         Task { [weak self] in
             guard let self else { return }
             do {
-                async let initializeTiles: Void = self.tileGenerator.initialize(bundleText: bundleText)
-                async let initializeStructures: Void = self.structureGenerator.initialize(bundleText: bundleText)
-                try await initializeTiles
-                try await initializeStructures
+                try await self.tileGenerator.initialize(bundleText: bundleText)
                 self.setLoading(false)
                 self.setStatus("Datapack ready. Enter a seed and click Render.")
             } catch {
@@ -1532,17 +1914,16 @@ private final class BrowserApp {
         if currentSeed != seed {
             currentSeed = seed
             tileCache.removeAll(keepingCapacity: true)
-            tileRasterCache.removeAll(keepingCapacity: true)
-            tileCanvasCache.removeAll(keepingCapacity: true)
             tileAtlas = nil
             fallbackTileAtlas = nil
+            releaseAtlasCanvases()
             visibleStructurePoints.removeAll(keepingCapacity: true)
             visibleLootContainers.removeAll(keepingCapacity: true)
             activeLootStructure = nil
             activeLootRequest += 1
             renderLootPanel(message: nil)
-            requestedStructureGeneration = nil
             tileDebugMetrics = TileDebugMetrics()
+            structureDebugMetrics = StructureProfilingMetrics()
             updateDebugPanel()
             context.fillStyle = placeholderColor.jsValue
             _ = context.fillRect!(0, 0, viewportWidth, viewportHeight)
@@ -1587,11 +1968,11 @@ private final class BrowserApp {
 
         drawVisibleRegion(seed: seed, viewState: viewState, generation: generation)
         drawGridOverlay(for: viewState)
-        scheduleStructureQuery(for: seed, viewState: viewState, generation: generation)
         pruneTileCache(for: seed, around: viewState)
 
         if pendingTileJobs.isEmpty {
             fallbackTileAtlas = nil
+            releaseCanvas(fallbackCanvas)
             drawTileAtlas(for: viewState, on: context)
             drawGridOverlay(for: viewState)
             emitProfilingMetrics()
@@ -1627,6 +2008,7 @@ private final class BrowserApp {
             minTileZ: minTileZ,
             maxTileZ: maxTileZ
         )
+        refreshVisibleStructures(for: viewState)
         drawTileAtlas(for: viewState, on: context)
 
         var missingJobs: [PendingTileJob] = []
@@ -1680,7 +2062,7 @@ private final class BrowserApp {
             return
         }
         inFlightTileJob = workerJob
-        let generator = tileGenerator
+        let generator = self.tileGenerator
         inFlightTileTask = Task { [weak self] in
             do {
                 let result = try await generator.generate(workerJob)
@@ -1767,7 +2149,7 @@ private final class BrowserApp {
         }
 
         let atlasStart = profilingNow()
-        guard let sourceCanvas = tileCanvas(for: key) else { return }
+        guard let sourceCanvas = makeTileCanvas(for: key) else { return }
         _ = snapshotContext.drawImage!(
             sourceCanvas,
             0,
@@ -1779,6 +2161,9 @@ private final class BrowserApp {
             tileSize,
             tileSize
         )
+        // The atlas owns the raster after this copy. Keeping a canvas per tile multiplies
+        // backing-store memory at large viewport sizes.
+        releaseCanvas(sourceCanvas)
         profilingMetrics.atlasMilliseconds += profilingNow() - atlasStart
     }
 
@@ -1834,16 +2219,31 @@ private final class BrowserApp {
     }
 
     private func invalidateTileRasters() {
-        tileRasterCache.removeAll(keepingCapacity: true)
-        tileCanvasCache.removeAll(keepingCapacity: true)
         tileAtlas = nil
         fallbackTileAtlas = nil
+        releaseAtlasCanvases()
+    }
+
+    private func releaseAtlasCanvases() {
+        releaseCanvas(snapshotCanvas)
+        releaseCanvas(fallbackCanvas)
+    }
+
+    private func releaseCanvas(_ canvas: JSObject) {
+        canvas.width = 1.jsValue
+        canvas.height = 1.jsValue
     }
 
     private func preserveTileAtlasAsFallback() {
         guard let tileAtlas else { return }
         let width = (tileAtlas.maxTileX - tileAtlas.minTileX + 1) * tileSize
         let height = (tileAtlas.maxTileZ - tileAtlas.minTileZ + 1) * tileSize
+        // This is only a transition aid. Do not duplicate a large atlas in memory.
+        guard width * height <= 2_000_000 else {
+            fallbackTileAtlas = nil
+            releaseCanvas(fallbackCanvas)
+            return
+        }
         fallbackCanvas.width = width.jsValue
         fallbackCanvas.height = height.jsValue
         configureCanvasContext(fallbackContext)
@@ -1851,18 +2251,14 @@ private final class BrowserApp {
         fallbackTileAtlas = tileAtlas
     }
 
-    private func tileCanvas(for key: TileCacheKey) -> JSObject? {
+    private func makeTileCanvas(for key: TileCacheKey) -> JSObject? {
         guard let tile = tileCache[key] else { return nil }
-        if let canvas = tileCanvasCache[key] {
-            return canvas
-        }
         let canvas = document.createElement!("canvas").object!
         canvas.width = tile.width.jsValue
         canvas.height = tile.height.jsValue
         guard let canvasContext = canvas.getContext!("2d").object else { return nil }
         configureCanvasContext(canvasContext)
         _ = canvasContext.putImageData!(tileImageData(for: tile, key: key), 0, 0)
-        tileCanvasCache[key] = canvas
         return canvas
     }
 
@@ -1870,10 +2266,6 @@ private final class BrowserApp {
         for tile: CachedTile,
         key cacheKey: TileCacheKey
     ) -> JSObject {
-        if let imageData = tileRasterCache[cacheKey] {
-            return imageData
-        }
-
         let rasterStart = profilingNow()
         var pixels = [UInt8](repeating: 255, count: tile.width * tile.height * 4)
         var resolvedColors: [String: BiomeColor] = [:]
@@ -1896,7 +2288,6 @@ private final class BrowserApp {
 
         let source = JSUInt8ClampedArray(pixels)
         let imageData = JSObject.global.ImageData.object!.new(source, tile.width, tile.height)
-        tileRasterCache[cacheKey] = imageData
         profilingMetrics.rasterMilliseconds += profilingNow() - rasterStart
         return imageData
     }
@@ -2006,6 +2397,22 @@ private final class BrowserApp {
         debugRenderTimeElement.innerText = formatDebugDuration(tileDebugMetrics.renderMilliseconds).jsValue
         debugPendingTilesElement.innerText = "\(pendingTileJobs.count)".jsValue
         debugCachedTilesElement.innerText = "\(tileCache.count)".jsValue
+        debugStructureTimeElement.innerText = formatDebugDuration(structureDebugMetrics.totalMilliseconds).jsValue
+        debugStructureSamplingElement.innerText = formatDebugDuration(structureDebugMetrics.samplingMilliseconds).jsValue
+        debugStructureValidationElement.innerText = formatDebugDuration(structureDebugMetrics.validationMilliseconds).jsValue
+        debugStructureCandidatesElement.innerText = "\(structureDebugMetrics.candidates)".jsValue
+        debugStructureAcceptedElement.innerText = "\(structureDebugMetrics.accepted)".jsValue
+        debugStructureRejectedElement.innerText = "\(structureDebugMetrics.rejected)".jsValue
+        debugStructureCacheHitsElement.innerText = "\(structureDebugMetrics.cacheHits)".jsValue
+        if structureDebugMetrics.byStructureType.isEmpty {
+            debugStructureTypesElement.innerText = "--".jsValue
+        } else {
+            let lines = structureDebugMetrics.byStructureType.keys.sorted().map { structureID in
+                let metrics = structureDebugMetrics.byStructureType[structureID]!
+                return "\(structureID): \(metrics.starts) starts, avg \(String(format: "%.1f", metrics.averageMilliseconds)) ms"
+            }
+            debugStructureTypesElement.innerText = lines.joined(separator: "\n").jsValue
+        }
     }
 
     private func formatDebugDuration(_ milliseconds: Double?) -> String {
@@ -2087,21 +2494,21 @@ private final class BrowserApp {
         let worldStartZ = viewState.centerZ - Double(viewState.viewportHeight) * viewState.blocksPerPixel / 2.0
         let worldEndX = worldStartX + Double(viewState.viewportWidth) * viewState.blocksPerPixel
         let worldEndZ = worldStartZ + Double(viewState.viewportHeight) * viewState.blocksPerPixel
-        let worldMarginX = Double(viewState.viewportWidth) * viewState.blocksPerPixel
-        let worldMarginZ = Double(viewState.viewportHeight) * viewState.blocksPerPixel
-        let minScale = max(0.125, viewState.blocksPerPixel * 0.5)
-        let maxScale = min(256.0, viewState.blocksPerPixel * 2.0)
+        let activeScaleKey = scaleKey(for: tileBlocksPerPixel(for: viewState.blocksPerPixel))
 
-        let previousTileKeys = Set(tileCache.keys)
         tileCache = tileCache.filter { key, _ in
             guard key.seed == seed else { return false }
 
-            let keyBlocksPerPixel = Double(key.scaleKey) / 1024.0
-            guard keyBlocksPerPixel >= minScale, keyBlocksPerPixel <= maxScale else {
+            guard key.scaleKey == activeScaleKey else {
                 return false
             }
 
+            let keyBlocksPerPixel = Double(key.scaleKey) / 1024.0
             let tileWorldSpan = Double(tileSize) * keyBlocksPerPixel
+            // Keep just a one-tile border for panning. A viewport-sized border retains up to
+            // nine full views and dominates memory on large displays.
+            let worldMarginX = tileWorldSpan
+            let worldMarginZ = tileWorldSpan
             let tileStartX = Double(key.tileX * tileSize) * keyBlocksPerPixel
             let tileStartZ = Double(key.tileZ * tileSize) * keyBlocksPerPixel
             let tileEndX = tileStartX + tileWorldSpan
@@ -2113,12 +2520,6 @@ private final class BrowserApp {
                 && tileEndZ >= worldStartZ - worldMarginZ
                 && tileStartZ <= worldEndZ + worldMarginZ
         }
-        let retainedTileKeys = Set(tileCache.keys)
-        tileRasterCache = tileRasterCache.filter { retainedTileKeys.contains($0.key) }
-        tileCanvasCache = tileCanvasCache.filter { retainedTileKeys.contains($0.key) }
-        if previousTileKeys != retainedTileKeys {
-            tileAtlas = nil
-        }
     }
 
     private func reloadStructureEditor(using dataPack: DataPack) {
@@ -2128,6 +2529,7 @@ private final class BrowserApp {
         structureColors = structureColors.filter { loadedStructureSet.contains($0.key) }
         enabledStructureSets = enabledStructureSets.filter { loadedStructureSet.contains($0.key) }
         structureSetSpacings = [:]
+        structureSetFrequencies.removeAll(keepingCapacity: true)
 
         for structureID in structureIDs where structureColors[structureID] == nil {
             structureColors[structureID] = defaultStructureSetColor(for: structureID, using: dataPack)
@@ -2137,10 +2539,14 @@ private final class BrowserApp {
         }
         for entry in dataPack.structureSetRegistry.entries() {
             guard let data = try? JSONEncoder().encode(entry.value),
-                  let encoded = try? JSONDecoder().decode(EncodedStructureSet.self, from: data),
-                  let spacing = encoded.placement.spacing
+                  let encoded = try? JSONDecoder().decode(EncodedStructureSet.self, from: data)
             else { continue }
-            structureSetSpacings[entry.key.name] = spacing
+            if let spacing = encoded.placement.spacing {
+                structureSetSpacings[entry.key.name] = spacing
+            }
+            if encoded.placement.frequency != nil {
+                structureSetFrequencies.insert(entry.key.name)
+            }
         }
         renderStructureEditor()
     }
@@ -2218,7 +2624,8 @@ private final class BrowserApp {
         syncStructureRow(for: structureID)
         if let viewState = latestViewState {
             drawGridOverlay(for: viewState)
-            scheduleLatestStructureQueryIfNeeded()
+            refreshVisibleStructures(for: viewState)
+            drawGridOverlay(for: viewState)
         }
     }
 
@@ -2505,7 +2912,10 @@ private final class BrowserApp {
 
     private func parseBiomeColorComponent(_ raw: String) -> UInt8? {
         if raw.hasPrefix("0x") || raw.hasPrefix("0X") {
-            return UInt8(raw.dropFirst(2), radix: 16)
+            guard let value = UInt8(raw.dropFirst(2), radix: 16), value >= 0, value <= 255 else {
+                return nil
+            }
+            return UInt8(value)
         }
         guard let value = Int(raw), value >= 0, value <= 255 else {
             return nil
@@ -2547,25 +2957,28 @@ private final class BrowserApp {
             enabledStructureSets: enabledStructureSetIDs(),
             minimumSpacingBlocks: minimumStructureSpacingBlocks(for: viewState)
         )
-        let structureGenerator = self.structureGenerator
+        let tileGenerator = self.tileGenerator
         inFlightStructureTask = Task { [weak self] in
             do {
-                let points = try await structureGenerator.structures(in: query)
-                self?.handleStructureQuery(points, for: generation, seed: seed)
+                let resultMaybe = try await tileGenerator.structures(in: query)
+                guard let result = resultMaybe else { return }
+                self?.handleStructureQuery(result, for: generation, seed: seed)
             } catch {
                 self?.handleStructureQueryFailure(error, for: generation)
             }
         }
     }
 
-    private func handleStructureQuery(_ points: [StructurePoint], for generation: Int, seed: WorldSeed) {
+    private func handleStructureQuery(_ result: StructureQueryResult, for generation: Int, seed: WorldSeed) {
         inFlightStructureTask = nil
         guard generation == activeViewGeneration, seed == currentSeed else {
             scheduleLatestStructureQueryIfNeeded()
             return
         }
-        visibleStructurePoints = points
-        setStructureSummary("Showing \(points.count) structure start\(points.count == 1 ? "" : "s") in this view.", isError: false)
+        structureDebugMetrics = result.metrics
+        updateDebugPanel()
+        visibleStructurePoints = result.points
+        setStructureSummary("Showing \(result.points.count) structure start\(result.points.count == 1 ? "" : "s") in this view.", isError: false)
         if let viewState = latestViewState {
             drawGridOverlay(for: viewState)
             scheduleConcentricStructureQuery(for: seed, viewState: viewState, generation: generation)
@@ -2587,21 +3000,24 @@ private final class BrowserApp {
             enabledStructureSets: enabledStructureSetIDs(),
             minimumSpacingBlocks: minimumStructureSpacingBlocks(for: viewState)
         )
-        let structureGenerator = self.structureGenerator
+        let tileGenerator = self.tileGenerator
         inFlightConcentricStructureTask = Task { [weak self] in
             do {
-                let points = try await structureGenerator.concentricStructures(in: query)
-                self?.handleConcentricStructureQuery(points, for: generation, seed: seed)
+                let resultMaybe = try await tileGenerator.concentricStructures(in: query)
+                guard let result = resultMaybe else { return }
+                self?.handleConcentricStructureQuery(result, for: generation, seed: seed)
             } catch {
                 self?.handleConcentricStructureQueryFailure(error, for: generation)
             }
         }
     }
 
-    private func handleConcentricStructureQuery(_ points: [StructurePoint], for generation: Int, seed: WorldSeed) {
+    private func handleConcentricStructureQuery(_ result: StructureQueryResult, for generation: Int, seed: WorldSeed) {
         inFlightConcentricStructureTask = nil
         guard generation == activeViewGeneration, seed == currentSeed else { return }
-        visibleStructurePoints = Array(Set(visibleStructurePoints).union(points)).sorted {
+        structureDebugMetrics.merge(result.metrics)
+        updateDebugPanel()
+        visibleStructurePoints = Array(Set(visibleStructurePoints).union(result.points)).sorted {
             ($0.z, $0.x, $0.setID, $0.structureID) < ($1.z, $1.x, $1.setID, $1.structureID)
         }
         setStructureSummary("Showing \(visibleStructurePoints.count) structure start\(visibleStructurePoints.count == 1 ? "" : "s") in this view.", isError: false)
@@ -2644,7 +3060,7 @@ private final class BrowserApp {
         let worldStartZ = viewState.centerZ - Double(viewState.viewportHeight) * viewState.blocksPerPixel / 2.0
         let pointSize = max(4.0, min(9.0, 6.0 / sqrt(viewState.blocksPerPixel)))
         for point in visibleStructurePoints {
-            guard shouldRenderStructureSet(point.setID, in: viewState) else { continue }
+        guard shouldRenderStructureSet(point.setID, in: viewState) else { continue }
             let screenX = (Double(point.x) - worldStartX) / viewState.blocksPerPixel
             let screenZ = (Double(point.z) - worldStartZ) / viewState.blocksPerPixel
             guard screenX >= -pointSize, screenX <= Double(viewState.viewportWidth) + pointSize,
@@ -2662,6 +3078,53 @@ private final class BrowserApp {
             overlayContext.fillStyle = structureColor(for: point.setID).cssHex.jsValue
             _ = overlayContext.fillRect!(screenX - pointSize / 2.0, screenZ - pointSize / 2.0, pointSize, pointSize)
         }
+    }
+
+    private func refreshVisibleStructures(for viewState: ViewState) {
+        guard let seed = currentSeed else { return }
+        let tileBlocksPerPixel = tileBlocksPerPixel(for: viewState.blocksPerPixel)
+        let scaleKey = scaleKey(for: tileBlocksPerPixel)
+        let tileWorldSpan = Double(tileSize) * tileBlocksPerPixel
+        let worldStartX = viewState.centerX - Double(viewState.viewportWidth) * viewState.blocksPerPixel / 2.0
+        let worldStartZ = viewState.centerZ - Double(viewState.viewportHeight) * viewState.blocksPerPixel / 2.0
+        let worldEndX = worldStartX + Double(viewState.viewportWidth) * viewState.blocksPerPixel
+        let worldEndZ = worldStartZ + Double(viewState.viewportHeight) * viewState.blocksPerPixel
+        let minTileX = Int(floor(worldStartX / tileWorldSpan))
+        let maxTileX = Int(floor((worldEndX - 0.0001) / tileWorldSpan))
+        let minTileZ = Int(floor(worldStartZ / tileWorldSpan))
+        let maxTileZ = Int(floor((worldEndZ - 0.0001) / tileWorldSpan))
+        let query = StructureQuery(
+            seed: seed,
+            minX: clampedWorldCoordinate(floor(worldStartX)),
+            maxX: clampedWorldCoordinate(ceil(worldEndX)),
+            minZ: clampedWorldCoordinate(floor(worldStartZ)),
+            maxZ: clampedWorldCoordinate(ceil(worldEndZ)),
+            enabledStructureSets: [],
+            minimumSpacingBlocks: 0
+        )
+
+        var points = Set<StructurePoint>()
+        var metrics = StructureProfilingMetrics()
+        for tileZ in minTileZ...maxTileZ {
+            for tileX in minTileX...maxTileX {
+                let key = TileCacheKey(seed: seed, scaleKey: scaleKey, tileX: tileX, tileZ: tileZ)
+                guard let tile = tileCache[key] else { continue }
+                metrics.merge(tile.structureMetrics)
+                for point in tile.structurePoints
+                where point.x >= query.minX && point.x <= query.maxX
+                      && point.z >= query.minZ && point.z <= query.maxZ
+                      &&
+                      shouldRenderStructureSet(point.setID, in: viewState) {
+                    points.insert(point)
+                }
+            }
+        }
+        visibleStructurePoints = points.sorted {
+            ($0.z, $0.x, $0.setID, $0.structureID) < ($1.z, $1.x, $1.setID, $1.structureID)
+        }
+        structureDebugMetrics = metrics
+        updateDebugPanel()
+        setStructureSummary("Showing \(visibleStructurePoints.count) structure start\(visibleStructurePoints.count == 1 ? "" : "s") in this view.", isError: false)
     }
 
     private func drawLootContainers(for viewState: ViewState) {
@@ -2795,7 +3258,7 @@ private final class BrowserApp {
         let local = localPointerPosition(clientX: clientX, clientY: clientY)
         guard let structure = structurePoint(nearScreenX: local.x, screenZ: local.y, in: viewState) else { return }
         let generation = activeViewGeneration
-        let generator = structureGenerator
+        let generator = self.tileGenerator
         activeLootRequest += 1
         let requestID = activeLootRequest
         visibleLootContainers.removeAll(keepingCapacity: true)
@@ -3057,6 +3520,9 @@ private final class BrowserApp {
 
     private func shouldRenderStructureSet(_ structureSetID: String, in viewState: ViewState) -> Bool {
         guard enabledStructureSets[structureSetID] ?? true else { return false }
+        if structureSetFrequencies.contains(structureSetID) {
+            return true
+        }
         guard let spacing = structureSetSpacings[structureSetID] else { return true }
         return Double(spacing) * 16.0 >= minimumStructureSpacingBlocks(for: viewState)
     }

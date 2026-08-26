@@ -10,6 +10,8 @@
 .map-frame:focus-visible { outline: 3px solid #7ca66b; outline-offset: 3px; }
 #map-overlay { cursor: inherit; }
 .structure-help { margin: 0; color: #667365; font-size: .82rem; line-height: 1.4; }
+.debug-breakdown-label { margin: .35rem 0 0; color: #667365; font-size: .82rem; }
+.debug-metrics pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: .76rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .loot-list { display: grid; gap: .6rem; }
 .loot-container { border: 1px solid var(--line); border-radius: .7rem; background: #fffdf7; overflow: hidden; }
 .loot-container summary { padding: .7rem .8rem; background: #f0eee4; font: .8rem ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }

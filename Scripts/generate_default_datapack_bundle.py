@@ -18,12 +18,14 @@ INCLUDE_GLOBS = [
     "data/minecraft/worldgen/noise_settings/overworld.json",
     "data/minecraft/worldgen/structure/*.json",
     "data/minecraft/worldgen/structure_set/*.json",
+    "data/minecraft/worldgen/template_pool/**/*.json",
+    "data/minecraft/worldgen/processor_list/**/*.json",
     "data/minecraft/tags/worldgen/biome/**/*.json",
     "data/minecraft/enchantment/**/*.json",
     "data/minecraft/tags/enchantment/**/*.json",
     "data/minecraft/tags/item/**/*.json",
     "data/minecraft/loot_table/**/*.json",
-    "data/minecraft/structure/woodland_mansion/**/*.nbt",
+    "data/minecraft/structure/**/*.nbt",
 ]
 
 
