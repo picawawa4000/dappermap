@@ -40,6 +40,8 @@ private final class SDLMapApplication {
     private var tooltip = ""
     private var loot: [MapLootPresentation] = []
     private var status = "Ready. Press R to render seed 0."
+    private var biomeGenerationStatus = "Biomes: waiting."
+    private var structureGenerationStatus = "Structures: waiting."
     private var sidebar: SidebarPresentation = DapperMapBase.sidebar()
     private var dragStart: (x: Int32, y: Int32)?
     private var dragOrigin = (x: 0.0, z: 0.0)
@@ -179,7 +181,7 @@ private final class SDLMapApplication {
         hasRendered = true
         renderGeneration &+= 1
         let generation = renderGeneration
-        status = "Compiling density functions…"
+        status = "Preparing world generator…"
         let root: URL
         do { root = try datapackRoot() }
         catch {
@@ -194,15 +196,30 @@ private final class SDLMapApplication {
         let maxTileX = Int(floor((worldStartX + Double(mapWidth) * blocksPerPixel - 0.0001) / span))
         let minTileZ = Int(floor(worldStartZ / span))
         let maxTileZ = Int(floor((worldStartZ + Double(mapHeight) * blocksPerPixel - 0.0001) / span))
-        let requests = (minTileZ...maxTileZ).flatMap { tileZ in
-            (minTileX...maxTileX).map { tileX in
+        let centerTileX = Int(floor(centerX / span))
+        let centerTileZ = Int(floor(centerZ / span))
+        let requests = MapMath.centerFirstTileCoordinates(
+            minTileX: minTileX,
+            maxTileX: maxTileX,
+            minTileZ: minTileZ,
+            maxTileZ: maxTileZ,
+            centerTileX: centerTileX,
+            centerTileZ: centerTileZ
+        ).map { tileX, tileZ in
                 MapTileRequest(generation: generation, seed: seed, centerX: centerX, centerZ: centerZ,
                     blocksPerPixel: blocksPerPixel, viewportWidth: mapWidth, viewportHeight: mapHeight,
                     tileBlocksPerPixel: tileBPP, tileX: tileX, tileZ: tileZ, sampleY: sampleY,
                     enabledStructureSets: enabledStructureSets)
-            }
         }
         pendingTileCount = requests.count
+        biomeGenerationStatus = requests.isEmpty
+            ? "Biomes: ready from cache."
+            : "Biomes: 0/\(requests.count) ready."
+        structureGenerationStatus = enabledStructureSets.isEmpty
+            ? "Structures: disabled."
+            : (requests.isEmpty
+                ? "Structures: ready from cache."
+                : "Structures: 0/\(requests.count) ready.")
         let workers = threadCount
         let platform: NativeGenerationPlatform
         if let cached = generationPlatform,
@@ -219,15 +236,25 @@ private final class SDLMapApplication {
         let startedAt = Date()
         Task.detached {
             do {
-                results.store(.progress(generation: generation, message: "Compiling density functions…", elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000))
+                results.store(.progress(generation: generation, message: "Preparing world generator…", elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000))
                 try await platform.initialize(rootURL: root)
                 let registry = await platform.registryIDs()
                 results.store(.registry(biomes: registry.biomes, structures: registry.structures))
-                results.store(.progress(generation: generation, message: "Compiling density functions…", elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000))
+                results.store(.progress(generation: generation, message: "Generating centre tiles first…", elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000))
                 try await withThrowingTaskGroup(of: MapTilePresentation.self) { group in
-                    for request in requests { group.addTask { try await platform.generateTile(request) } }
+                    var nextRequest = 0
+                    for _ in 0..<min(workers, requests.count) {
+                        let request = requests[nextRequest]
+                        nextRequest += 1
+                        group.addTask { try await platform.generateTile(request) }
+                    }
                     var completed = 0
                     for try await tile in group {
+                        if nextRequest < requests.count {
+                            let request = requests[nextRequest]
+                            nextRequest += 1
+                            group.addTask { try await platform.generateTile(request) }
+                        }
                         completed += 1
                         results.store(.tile(
                             generation: generation,
@@ -260,6 +287,10 @@ private final class SDLMapApplication {
                 installTexture(for: generatedTile, key: key, renderer: renderer)
                 tile = generatedTile
                 pendingTileCount = max(0, total - completed)
+                biomeGenerationStatus = "Biomes: \(completed)/\(total) ready."
+                structureGenerationStatus = enabledStructureSets.isEmpty
+                    ? "Structures: disabled."
+                    : "Structures: \(completed)/\(total) ready."
                 let compilation = generatedTile.densityCompilationMilliseconds.flatMap { milliseconds in
                     generatedTile.densityCompilationBackend.map { " \($0) compile \(formatDuration(milliseconds))." }
                 } ?? ""
@@ -273,6 +304,8 @@ private final class SDLMapApplication {
                 status = message
             case let .failure(generation, message) where generation == renderGeneration:
                 status = message
+                biomeGenerationStatus = "Biomes: generation failed."
+                structureGenerationStatus = "Structures: generation failed."
             default:
                 break
             }
@@ -350,11 +383,15 @@ private final class SDLMapApplication {
         }
         if tab.id == "map" {
             let cursor = editingSeed && (SDL_GetTicks() / 500).isMultiple(of: 2) ? "_" : ""
-            drawText(renderer, text: "SEED \(seedText)\(cursor)", x: mapWidth + 18, y: y, scale: 2)
-            drawText(renderer, text: "Y \(sampleY)  PGUP/PGDN", x: mapWidth + 18, y: y + 32, scale: 1)
-            drawText(renderer, text: "X \(Int(centerX)) Z \(Int(centerZ))", x: mapWidth + 18, y: y + 50, scale: 2)
-            drawText(renderer, text: "BPP \(blocksPerPixel)", x: mapWidth + 18, y: y + 82, scale: 2)
+            drawText(renderer, text: "SEED", x: mapWidth + 18, y: y, scale: 1)
+            drawText(renderer, text: "\(seedText)\(cursor)", x: mapWidth + 18, y: y + 16, scale: 2)
+            drawText(renderer, text: "Y", x: mapWidth + 18, y: y + 48, scale: 1)
+            drawText(renderer, text: "\(sampleY)  PGUP/PGDN", x: mapWidth + 18, y: y + 64, scale: 2)
+            drawText(renderer, text: "STATUS", x: mapWidth + 18, y: y + 100, scale: 1)
             drawText(renderer, text: status, x: mapWidth + 18, y: y + 116, scale: 1)
+            drawText(renderer, text: biomeGenerationStatus, x: mapWidth + 18, y: y + 138, scale: 1)
+            drawText(renderer, text: structureGenerationStatus, x: mapWidth + 18, y: y + 160, scale: 1)
+            drawText(renderer, text: "X \(Int(centerX)) Z \(Int(centerZ)) BPP \(blocksPerPixel)", x: mapWidth + 18, y: y + 182, scale: 1)
         } else if tab.id == "debug" {
             let last = tile.map { "\($0.tileX), \($0.tileZ)" } ?? "WAITING"
             drawText(renderer, text: "LAST TILE \(last)", x: mapWidth + 18, y: y, scale: 1)

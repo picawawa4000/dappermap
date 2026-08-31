@@ -34,6 +34,45 @@ public enum MapMath {
         let clamped = min(256.0, max(0.125, blocksPerPixel))
         return min(256.0, max(0.125, pow(2.0, floor(log2(clamped)))))
     }
+
+    /// Produces the same deterministic centre-out spiral for every frontend.
+    public static func centerFirstTileCoordinates(
+        minTileX: Int,
+        maxTileX: Int,
+        minTileZ: Int,
+        maxTileZ: Int,
+        centerTileX: Int,
+        centerTileZ: Int
+    ) -> [(tileX: Int, tileZ: Int)] {
+        var coordinates: [(tileX: Int, tileZ: Int)] = []
+        coordinates.reserveCapacity((maxTileX - minTileX + 1) * (maxTileZ - minTileZ + 1))
+        for tileZ in minTileZ...maxTileZ {
+            for tileX in minTileX...maxTileX {
+                coordinates.append((tileX, tileZ))
+            }
+        }
+        coordinates.sort {
+            centerFirstKey(tileX: $0.tileX, tileZ: $0.tileZ, centerTileX: centerTileX, centerTileZ: centerTileZ)
+                < centerFirstKey(tileX: $1.tileX, tileZ: $1.tileZ, centerTileX: centerTileX, centerTileZ: centerTileZ)
+        }
+        return coordinates
+    }
+
+    private static func centerFirstKey(
+        tileX: Int,
+        tileZ: Int,
+        centerTileX: Int,
+        centerTileZ: Int
+    ) -> (Int, Int, Int) {
+        let dx = tileX - centerTileX
+        let dz = tileZ - centerTileZ
+        let ring = max(abs(dx), abs(dz))
+        if ring == 0 { return (0, 0, 0) }
+        if dx == ring && dz > -ring { return (ring, 0, dz + ring) }
+        if dz == ring && dx < ring { return (ring, 1, ring - dx) }
+        if dx == -ring && dz < ring { return (ring, 2, ring - dz) }
+        return (ring, 3, dx + ring)
+    }
 }
 
 struct DatapackBundle: Decodable {
@@ -44,6 +83,21 @@ struct DatapackBundleFile: Decodable {
     let path: String
     let contents: String?
     let base64Contents: String?
+}
+
+/// The small subset of registry information the browser UI needs. Keeping this separate from
+/// `DataPack` lets the generation worker own the decoded datapack instead of retaining a second
+/// complete copy in the UI WebAssembly instance.
+struct BrowserRegistryMetadata: Sendable {
+    let biomeIDs: [String]
+    let structureSets: [BrowserStructureSetMetadata]
+}
+
+struct BrowserStructureSetMetadata: Sendable {
+    let id: String
+    let spacing: Int32?
+    let hasFrequency: Bool
+    let structureIDs: [String]
 }
 
 enum BrowserAppError: Error {
@@ -77,6 +131,7 @@ struct TileSamplerKey: Hashable, Sendable {
     let sampleHeight: Int32
     let sampleYCount: Int32
     let sampleScale: Int32
+    let sampleYStep: Int32
 }
 
 public struct BiomeColor: Equatable, Sendable {
@@ -113,10 +168,10 @@ final class TileBiomeCache: @unchecked Sendable {
     let height: Int
     let minY: Int32
     let yCount: Int
-    private var columns: [Int64: [String]] = [:]
-    private let columnSampler: (Int32, Int32) throws -> [String]
+    private var samples: [StructureBiomePositionKey: String] = [:]
+    private let positionSampler: (PosInt3D) throws -> String
 
-    init(startX: Int32, startZ: Int32, scale: Int32, width: Int, height: Int, minY: Int32, yCount: Int, columnSampler: @escaping (Int32, Int32) throws -> [String]) {
+    init(startX: Int32, startZ: Int32, scale: Int32, width: Int, height: Int, minY: Int32, yCount: Int, positionSampler: @escaping (PosInt3D) throws -> String) {
         self.startX = startX
         self.startZ = startZ
         self.scale = scale
@@ -124,7 +179,7 @@ final class TileBiomeCache: @unchecked Sendable {
         self.height = height
         self.minY = minY
         self.yCount = yCount
-        self.columnSampler = columnSampler
+        self.positionSampler = positionSampler
     }
 
     var usableMinX: Int32 { startX &+ 32 }
@@ -139,18 +194,22 @@ final class TileBiomeCache: @unchecked Sendable {
         let x = min(max(floorDivide(position.x &- startX, by: scale), 0), Int32(width - 1))
         let z = min(max(floorDivide(position.z &- startZ, by: scale), 0), Int32(height - 1))
         let y = min(max(Int((Double(position.y - minY) / 4.0).rounded()), 0), yCount - 1)
-        // DPReader bulk biome volumes are ordered z, then x, then y.
-        let key = (Int64(x) << 32) | Int64(UInt32(bitPattern: z))
-        let column: [String]
-        if let cached = columns[key] {
-            column = cached
-        } else {
-            let worldX = startX &+ x &* scale
-            let worldZ = startZ &+ z &* scale
-            column = try columnSampler(worldX, worldZ)
-            columns[key] = column
+        let sampledPosition = PosInt3D(
+            x: startX &+ x &* scale,
+            y: minY &+ Int32(y) &* 4,
+            z: startZ &+ z &* scale
+        )
+        let key = StructureBiomePositionKey(
+            x: sampledPosition.x,
+            y: sampledPosition.y,
+            z: sampledPosition.z
+        )
+        if let cached = samples[key] {
+            return RegistryKey(referencing: cached)
         }
-        return RegistryKey(referencing: column[y])
+        let biome = try positionSampler(sampledPosition)
+        samples[key] = biome
+        return RegistryKey(referencing: biome)
     }
 }
 
@@ -176,9 +235,35 @@ struct PendingTileJob: Sendable {
 
 struct GeneratedTile: Sendable {
     let tile: CachedTile
+    /// Retained only long enough for the browser's deferred structure pass. The cache lazily
+    /// samples columns from the same generator that produced the biome tile.
+    let biomeCache: TileBiomeCache?
     let generationMilliseconds: Double
     let densityCompilationMilliseconds: Double?
     let densityCompilationBackend: String?
+}
+
+struct PendingTileStructureJob: Sendable {
+    let tileJob: PendingTileJob
+    let biomeCache: TileBiomeCache
+}
+
+struct StructureValidationKey: Hashable, Sendable {
+    let setID: String
+    let chunkX: Int32
+    let chunkZ: Int32
+}
+
+struct RandomStructureRegionKey: Hashable, Sendable {
+    let setID: String
+    let regionX: Int32
+    let regionZ: Int32
+}
+
+struct StructureBiomePositionKey: Hashable, Sendable {
+    let x: Int32
+    let y: Int32
+    let z: Int32
 }
 
 struct StructurePoint: Hashable, Sendable {

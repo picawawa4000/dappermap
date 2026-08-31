@@ -28,6 +28,8 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
     private var seedInput: NSTextField?
     private var yInput: NSTextField?
     private var statusLabel: NSTextField?
+    private var biomeGenerationStatusLabel: NSTextField?
+    private var structureGenerationStatusLabel: NSTextField?
     private var biomeList: NSStackView?
     private var structureList: NSStackView?
     private var biomeColors: [String: BiomeColor] = [:]
@@ -112,9 +114,11 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         let wasAwaitingFirstTile = awaitingFirstTileForSeed
         awaitingFirstTileForSeed = false
         updateDebug(lastTile: tile)
+        biomeGenerationStatusLabel?.stringValue = "Biomes: \(completedTiles)/\(completedTiles + pendingTiles) tile(s) ready."
+        structureGenerationStatusLabel?.stringValue = "Structures: \(completedTiles)/\(completedTiles + pendingTiles) tile(s) ready."
         if pendingTiles == 0 {
             commonBase.render(
-                status: "Rendered seed \(tile.seed) at Y=256, centered on (\(Int(mapView.centerX)), \(Int(mapView.centerZ))) with \(String(format: "%.2f", mapView.blocksPerPixel)) block(s) per pixel."
+                status: "Rendered seed \(tile.seed) at Y=\(currentSampleY), centered on (\(Int(mapView.centerX)), \(Int(mapView.centerZ))) with \(String(format: "%.2f", mapView.blocksPerPixel)) block(s) per pixel."
             )
         } else if wasAwaitingFirstTile {
             commonBase.render(status: "Generating remaining tiles…")
@@ -242,17 +246,20 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
 
         switch tab.id {
         case "map":
-            let seedLabel = label(tab.fields.first?.label ?? "Seed Value", size: 12, bold: true)
+            let seedField = tab.fields.first { $0.id == "seed" }
+            let yFieldPresentation = tab.fields.first { $0.id == "y" }
+            let seedLabel = label(seedField?.label ?? "Seed", size: 15, bold: true)
             stack.addArrangedSubview(seedLabel)
-            let input = NSTextField(string: tab.fields.first?.value ?? "0")
+            let input = NSTextField(string: seedField?.value ?? "0")
             input.font = NSFont(name: "Menlo", size: 13) ?? .monospacedSystemFont(ofSize: 13, weight: .regular)
             input.widthAnchor.constraint(equalToConstant: 324).isActive = true
             input.target = self
             input.action = #selector(renderSeed)
             stack.addArrangedSubview(input)
             seedInput = input
-            stack.addArrangedSubview(label("Y (multiples of 4)", size: 12, bold: true))
-            let yField = NSTextField(string: "256")
+            stack.addArrangedSubview(label(yFieldPresentation?.label ?? "Y", size: 15, bold: true))
+            stack.addArrangedSubview(label("Multiples of 4", size: 11, bold: false))
+            let yField = NSTextField(string: yFieldPresentation?.value ?? "256")
             yField.widthAnchor.constraint(equalToConstant: 324).isActive = true
             yField.target = self
             yField.action = #selector(renderSeed)
@@ -263,10 +270,19 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             button.keyEquivalent = "\r"
             button.widthAnchor.constraint(equalToConstant: 324).isActive = true
             stack.addArrangedSubview(button)
+            stack.addArrangedSubview(label("Status", size: 15, bold: true))
             let status = wrappingLabel("Loading Minecraft 1.21.11 datapack…")
             status.widthAnchor.constraint(equalToConstant: 324).isActive = true
             stack.addArrangedSubview(status)
             statusLabel = status
+            let biomeStatus = wrappingLabel("Biomes: waiting.")
+            biomeStatus.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            stack.addArrangedSubview(biomeStatus)
+            biomeGenerationStatusLabel = biomeStatus
+            let structureStatus = wrappingLabel("Structures: waiting for biomes.")
+            structureStatus.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            stack.addArrangedSubview(structureStatus)
+            structureGenerationStatusLabel = structureStatus
         case "biomes":
             let list = colorList()
             stack.addArrangedSubview(list.scroll)
@@ -509,7 +525,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         let sampleY = Int32((Double(min(316, max(-64, rawY)) / 4).rounded())) * 4
         yInput?.integerValue = Int(sampleY)
         if currentSeed != seed || currentSampleY != sampleY {
-            commonBase.render(status: "Compiling density functions…")
+            commonBase.render(status: "Preparing generator state…")
             currentSeed = seed
             currentSampleY = sampleY
             awaitingFirstTileForSeed = true
@@ -535,6 +551,8 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         renderTask?.cancel()
         scheduler = nil
         commonBase.render(status: "Loading datapack for \(threadCount) generation thread\(threadCount == 1 ? "" : "s")…")
+        biomeGenerationStatusLabel?.stringValue = "Biomes: preparing generator."
+        structureGenerationStatusLabel?.stringValue = "Structures: waiting for generator."
         do {
             dataPackRoot = try Self.findDatapackRoot()
         } catch {
@@ -545,7 +563,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         Task { [weak self] in
             guard let self else { return }
             do {
-                self.commonBase.render(status: "Compiling density functions…")
+                self.commonBase.render(status: "Preparing world generator…")
                 let next = NativeGenerationPlatform(threadCount: threadCount)
                 try await next.initialize(rootURL: root)
                 let registry = await next.registryIDs()
@@ -554,6 +572,8 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
                 self.populateBiomeList(registry.biomes)
                 self.populateStructureList(registry.structures)
                 self.commonBase.render(status: "Datapack ready. Enter a seed and click Render.")
+                self.biomeGenerationStatusLabel?.stringValue = "Biomes: ready to render."
+                self.structureGenerationStatusLabel?.stringValue = "Structures: ready to render."
                 if self.currentSeed != nil { self.scheduleRender(immediately: true) }
             } catch {
                 self.commonBase.render(status: "Failed to initialize DPReader: \(error)", isError: true)
@@ -590,8 +610,16 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         let minTileZ = Int(floor(worldStartZ / span))
         let maxTileZ = Int(floor((worldEndZ - 0.0001) / span))
         var requests: [MapTileRequest] = []
-        for tileZ in minTileZ...maxTileZ {
-            for tileX in minTileX...maxTileX {
+        let centerTileX = Int(floor(mapView.centerX / span))
+        let centerTileZ = Int(floor(mapView.centerZ / span))
+        for (tileX, tileZ) in MapMath.centerFirstTileCoordinates(
+            minTileX: minTileX,
+            maxTileX: maxTileX,
+            minTileZ: minTileZ,
+            maxTileZ: maxTileZ,
+            centerTileX: centerTileX,
+            centerTileZ: centerTileZ
+        ) {
                 let key = NativeTileKey(seed: seed, scaleKey: scaleKey, tileX: tileX, tileZ: tileZ)
                 guard mapView.tiles[key] == nil else { continue }
                 requests.append(MapTileRequest(
@@ -608,28 +636,47 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
                     sampleY: Int32((Double(min(316, max(-64, yInput?.integerValue ?? 256)) / 4).rounded())) * 4,
                     enabledStructureSets: enabledStructureSets
                 ))
-            }
         }
         pendingTiles = requests.count
         completedTiles = 0
+        biomeGenerationStatusLabel?.stringValue = requests.isEmpty
+            ? "Biomes: ready from tile cache."
+            : "Biomes: 0/\(requests.count) tile(s) ready."
+        structureGenerationStatusLabel?.stringValue = requests.isEmpty
+            ? "Structures: ready from tile cache."
+            : (enabledStructureSets.isEmpty
+                ? "Structures: disabled."
+                : "Structures: 0/\(requests.count) tile(s) ready.")
         mapView.needsDisplay = true
         if requests.isEmpty {
             commonBase.render(status: "Rendered seed \(seed) from the native tile cache.")
             return
         }
         commonBase.render(status: awaitingFirstTileForSeed
-            ? "Compiling density functions…"
+            ? "Generating centre biome tiles…"
             : "Rendering seed \(seed) on \(threadCount) thread\(threadCount == 1 ? "" : "s"). Loading \(requests.count) tile(s)…")
         updateDebug(lastTile: nil)
+        let concurrency = threadCount
         renderTask = Task { [weak self] in
             await withTaskGroup(of: Result<MapTilePresentation, Error>.self) { group in
-                for request in requests {
+                var nextRequest = 0
+                for _ in 0..<min(concurrency, requests.count) {
+                    let request = requests[nextRequest]
+                    nextRequest += 1
                     group.addTask {
                         do { return .success(try await scheduler.generateTile(request)) }
                         catch { return .failure(error) }
                     }
                 }
                 for await result in group {
+                    if nextRequest < requests.count {
+                        let request = requests[nextRequest]
+                        nextRequest += 1
+                        group.addTask {
+                            do { return .success(try await scheduler.generateTile(request)) }
+                            catch { return .failure(error) }
+                        }
+                    }
                     guard let self, activeGeneration == self.generation else { continue }
                     switch result {
                     case .success(let tile):
@@ -637,6 +684,8 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
                     case .failure(let error):
                         self.pendingTiles = max(0, self.pendingTiles - 1)
                         self.commonBase.render(status: "Render failed: \(error)", isError: true)
+                        self.biomeGenerationStatusLabel?.stringValue = "Biomes: generation failed."
+                        self.structureGenerationStatusLabel?.stringValue = "Structures: generation failed."
                     }
                 }
             }

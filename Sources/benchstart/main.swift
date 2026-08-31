@@ -1,7 +1,7 @@
 import DPReader
 import Foundation
 
-private let bundlePath = URL(fileURLWithPath: "Web/default-datapack.bundle.json")
+private let bundlePath = URL(fileURLWithPath: "Web/default-datapack.bundle.json.gz")
 private let runtimeRoot = URL(fileURLWithPath: "/private/tmp/dappermap-bench-default-datapack", isDirectory: true)
 private let mapSize = 256
 private let halfMapSize = Int32(mapSize / 2)
@@ -13,7 +13,23 @@ private struct DatapackBundle: Decodable {
 
 private struct DatapackBundleFile: Decodable {
     let path: String
-    let contents: String
+    let contents: String?
+    let base64Contents: String?
+}
+
+private func decompressGzip(at url: URL) throws -> Data {
+    let process = Process()
+    let standardOutput = Pipe()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/gzip")
+    process.arguments = ["-dc", url.path]
+    process.standardOutput = standardOutput
+    try process.run()
+    let data = try standardOutput.fileHandleForReading.readToEnd() ?? Data()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw CocoaError(.fileReadCorruptFile)
+    }
+    return data
 }
 
 private struct StageTimer {
@@ -55,12 +71,12 @@ enum BenchStart {
         let timer = StageTimer()
         let fileManager = FileManager.default
 
-        let bundleText = try timer.time("read bundle text") {
-            try String(contentsOf: bundlePath, encoding: .utf8)
+        let bundleData = try timer.time("decompress bundle") {
+            try decompressGzip(at: bundlePath)
         }
 
         let bundle = try timer.time("decode bundle json") {
-            try JSONDecoder().decode(DatapackBundle.self, from: Data(bundleText.utf8))
+            try JSONDecoder().decode(DatapackBundle.self, from: bundleData)
         }
         print("bundle files: \(bundle.files.count)")
 
@@ -70,7 +86,16 @@ enum BenchStart {
             for file in bundle.files {
                 let fileURL = runtimeRoot.appendingPathComponent(file.path)
                 try fileManager.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
-                try Data(file.contents.utf8).write(to: fileURL)
+                let data: Data
+                if let contents = file.contents {
+                    data = Data(contents.utf8)
+                } else if let base64Contents = file.base64Contents,
+                          let decoded = Data(base64Encoded: base64Contents) {
+                    data = decoded
+                } else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                try data.write(to: fileURL)
             }
         }
 
@@ -109,5 +134,27 @@ enum BenchStart {
         }
 
         print("generated biomes: \(biomes?.count ?? 0)")
+
+        try timer.time("set world seed") {
+            try generator.setWorldSeed(12_345_678)
+        }
+        _ = try timer.time("generate biome square after reseed") {
+            try generator.generateBiomesInSquare(
+                from: PosInt2D(x: -halfMapSize, z: -halfMapSize),
+                to: PosInt2D(x: halfMapSize, z: halfMapSize),
+                atY: sampleY,
+                in: RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld"),
+                scale: 1
+            )
+        }
+        _ = try timer.time("generate warm biome square") {
+            try generator.generateBiomesInSquare(
+                from: PosInt2D(x: -halfMapSize, z: -halfMapSize),
+                to: PosInt2D(x: halfMapSize, z: halfMapSize),
+                atY: sampleY,
+                in: RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld"),
+                scale: 1
+            )
+        }
     }
 }

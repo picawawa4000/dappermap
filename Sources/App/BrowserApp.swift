@@ -23,6 +23,8 @@ final class BrowserApp: DapperMapPlatform {
     private let yInput: JSObject
     private let renderButton: JSObject
     private let statusElement: JSObject
+    private let biomeGenerationStatusElement: JSObject
+    private let structureGenerationStatusElement: JSObject
     private let biomeResetButton: JSObject
     private let biomeImportButton: JSObject
     private let biomeExportButton: JSObject
@@ -64,7 +66,7 @@ final class BrowserApp: DapperMapPlatform {
 
     private var retainedClosures: [JSClosure] = []
     private var pendingTimer: JSTimer?
-    private var dataPack: DataPack?
+    private var generatorReady = false
     private var currentSeed: WorldSeed?
     private var currentSampleY: Int32 = defaultSampleY
     private var awaitingFirstTileForSeed = false
@@ -74,6 +76,8 @@ final class BrowserApp: DapperMapPlatform {
     private var requestedStructureGeneration: Int?
     private var inFlightTileJob: PendingTileJob?
     private var inFlightTileTask: Task<Void, Never>?
+    private var inFlightTileStructureJob: PendingTileStructureJob?
+    private var inFlightTileStructureTask: Task<Void, Never>?
     private var pendingRenderTimer: JSTimer?
     private var pendingTileTimer: JSTimer?
     private var latestViewState: ViewState?
@@ -81,6 +85,9 @@ final class BrowserApp: DapperMapPlatform {
     private var tileAtlas: TileAtlas?
     private var fallbackTileAtlas: TileAtlas?
     private var pendingTileJobs: [PendingTileJob] = []
+    private var pendingTileStructureJobs: [PendingTileStructureJob] = []
+    private var biomeTilesTotal = 0
+    private var biomeTilesCompleted = 0
     private var activeViewGeneration = 0
     private var profilingEnabled = false
     private var profilingMetrics = TileProfilingMetrics()
@@ -94,6 +101,7 @@ final class BrowserApp: DapperMapPlatform {
     private var enabledStructureSets: [String: Bool] = [:]
     private var structureSetSpacings: [String: Int32] = [:]
     private var structureSetFrequencies: Set<String> = []
+    private var structureSetStructureIDs: [String: [String]] = [:]
     private var structureRowElements: [String: StructureRowElements] = [:]
     private var loadedStructureIDs: [String] = []
     private var visibleStructurePoints: [StructurePoint] = []
@@ -130,6 +138,8 @@ final class BrowserApp: DapperMapPlatform {
         self.yInput = document.getElementById!("y-input").object!
         self.renderButton = document.getElementById!("render-button").object!
         self.statusElement = document.getElementById!("status").object!
+        self.biomeGenerationStatusElement = document.getElementById!("biome-generation-status").object!
+        self.structureGenerationStatusElement = document.getElementById!("structure-generation-status").object!
         self.biomeResetButton = document.getElementById!("biome-reset-button").object!
         self.biomeImportButton = document.getElementById!("biome-import-button").object!
         self.biomeExportButton = document.getElementById!("biome-export-button").object!
@@ -215,6 +225,12 @@ final class BrowserApp: DapperMapPlatform {
 
         let key = TileCacheKey(seed: seed, scaleKey: scaleKey(for: job.tileBlocksPerPixel), tileX: job.tileX, tileZ: job.tileZ)
         tileCache[key] = result.tile
+        if let biomeCache = result.biomeCache,
+           !(job.enabledStructureSets?.isEmpty ?? false) {
+            pendingTileStructureJobs.append(PendingTileStructureJob(tileJob: job, biomeCache: biomeCache))
+        }
+        biomeTilesCompleted += 1
+        setBiomeGenerationStatus("Biomes: \(biomeTilesCompleted)/\(biomeTilesTotal) tile(s) ready.")
         refreshVisibleStructures(for: currentViewState())
         tileDebugMetrics.tileX = job.tileX
         tileDebugMetrics.tileZ = job.tileZ
@@ -247,7 +263,8 @@ final class BrowserApp: DapperMapPlatform {
 
         guard let viewState = latestViewState else { return }
         if pendingTileJobs.isEmpty {
-            setStatus("Rendered seed \(displaySeed(seed)) at Y=256, centered on (\(Int(viewState.centerX.rounded())), \(Int(viewState.centerZ.rounded()))) with \(String(format: "%.2f", viewState.blocksPerPixel)) block(s) per pixel.")
+            setStatus("Rendered seed \(displaySeed(seed)) at Y=\(currentSampleY), centered on (\(Int(viewState.centerX.rounded())), \(Int(viewState.centerZ.rounded()))) with \(String(format: "%.2f", viewState.blocksPerPixel)) block(s) per pixel.")
+            scheduleNextTileStructure()
         } else {
             scheduleNextTileBatch()
         }
@@ -263,6 +280,8 @@ final class BrowserApp: DapperMapPlatform {
         pendingTileJobs.removeAll(keepingCapacity: true)
         updateDebugPanel()
         setStatus("Render failed: \(error)", isError: true)
+        setBiomeGenerationStatus("Biomes: failed — \(error)", isError: true)
+        setStructureGenerationStatus("Structures: stopped because biome generation failed.", isError: true)
     }
 
     private func attachHandlers() {
@@ -444,39 +463,11 @@ final class BrowserApp: DapperMapPlatform {
                 self.setLoading(false)
                 self.setStatus("Failed to load datapack bundle: \(self.describe(error))", isError: true)
             case .success(let text):
-                do {
-                    let bundle = try JSONDecoder().decode(DatapackBundle.self, from: Data(text.utf8))
-                    self.setStatus("Materializing datapack files…")
-                    let rootURL = try self.materialize(bundle: bundle)
-                    self.scheduleNextTick { [weak self] in
-                        self?.initializeDataPack(at: rootURL, bundleText: text)
-                    }
-                } catch {
-                    self.setLoading(false)
-                    self.setStatus("Failed to initialize DPReader: \(error)", isError: true)
-                }
+                // The tile worker owns the materialised DataPack. Retaining one here as well
+                // duplicates its large registries in shared WebAssembly memory and can force a
+                // WebKit-hostile memory growth before the first render.
+                self.startTileGenerator(bundleText: text)
             }
-        }
-    }
-
-    private func initializeDataPack(at rootURL: URL, bundleText: String) {
-        do {
-            setStatus("Parsing datapack…")
-            self.dataPack = try DataPack(
-                fromRootPath: rootURL,
-                loadingOptions: [
-                    .noDimensions
-                ],
-                decodingVersion: .assumedCurrent
-            )
-            if let dataPack {
-                reloadBiomeEditor(using: dataPack)
-                reloadStructureEditor(using: dataPack)
-            }
-            startTileGenerator(bundleText: bundleText)
-        } catch {
-            self.setLoading(false)
-            self.setStatus("Failed to initialize DPReader: \(error)", isError: true)
         }
     }
 
@@ -486,6 +477,10 @@ final class BrowserApp: DapperMapPlatform {
             guard let self else { return }
             do {
                 try await self.tileGenerator.initialize(bundleText: bundleText)
+                let metadata = await self.tileGenerator.browserRegistryMetadata()
+                self.reloadBiomeEditor(using: metadata.biomeIDs)
+                self.reloadStructureEditor(using: metadata.structureSets)
+                self.generatorReady = true
                 self.setLoading(false)
                 self.setStatus("Datapack ready. Enter a seed and click Render.")
             } catch {
@@ -495,34 +490,8 @@ final class BrowserApp: DapperMapPlatform {
         }
     }
 
-    private func materialize(bundle: DatapackBundle) throws -> URL {
-        let rootURL = URL(fileURLWithPath: runtimeDatapackPath, isDirectory: true)
-        let fileManager = FileManager.default
-        try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true, attributes: nil)
-
-        for file in bundle.files {
-            let url = rootURL.appendingPathComponent(file.path)
-            let directoryURL = url.deletingLastPathComponent()
-            try fileManager.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
-            let contents: Data
-            if let base64Contents = file.base64Contents {
-                guard let decoded = Data(base64Encoded: base64Contents) else {
-                    throw BrowserAppError.message("Datapack bundle contains invalid base64 data for \(file.path).")
-                }
-                contents = decoded
-            } else if let text = file.contents {
-                contents = Data(text.utf8)
-            } else {
-                throw BrowserAppError.message("Datapack bundle is missing contents for \(file.path).")
-            }
-            try contents.write(to: url)
-        }
-
-        return rootURL
-    }
-
     private func prepareRender() {
-        guard dataPack != nil else {
+        guard generatorReady else {
             setStatus("Datapack is still loading.", isError: true)
             return
         }
@@ -538,6 +507,8 @@ final class BrowserApp: DapperMapPlatform {
             currentSampleY = sampleY
             awaitingFirstTileForSeed = true
             tileCache.removeAll(keepingCapacity: true)
+            pendingTileStructureJobs.removeAll(keepingCapacity: true)
+            inFlightTileStructureTask?.cancel()
             tileAtlas = nil
             fallbackTileAtlas = nil
             releaseAtlasCanvases()
@@ -563,6 +534,10 @@ final class BrowserApp: DapperMapPlatform {
 
         latestViewState = viewState
         activeViewGeneration += 1
+        // The worker is serial. Ask obsolete work to stop at its next sampling boundary so a
+        // zoom or pan does not sit behind structure validation for the previous viewport.
+        inFlightTileTask?.cancel()
+        inFlightTileStructureTask?.cancel()
         pendingTileTimer = nil
         pendingTileJobs.removeAll(keepingCapacity: true)
         guard pendingRenderTimer == nil else { return }
@@ -601,14 +576,14 @@ final class BrowserApp: DapperMapPlatform {
             drawGridOverlay(for: viewState)
             emitProfilingMetrics()
             setStatus(
-                "Rendered seed \(displaySeed(seed)) at Y=256, centered on (\(Int(viewState.centerX.rounded())), \(Int(viewState.centerZ.rounded()))) with \(String(format: "%.2f", viewState.blocksPerPixel)) block(s) per pixel."
+                "Rendered seed \(displaySeed(seed)) at Y=\(currentSampleY), centered on (\(Int(viewState.centerX.rounded())), \(Int(viewState.centerZ.rounded()))) with \(String(format: "%.2f", viewState.blocksPerPixel)) block(s) per pixel."
             )
         } else if awaitingFirstTileForSeed {
             setStatus("Compiling density functions…")
             scheduleNextTileBatch()
         } else {
             setStatus(
-                "Rendering seed \(displaySeed(seed)) at Y=256, centered on (\(Int(viewState.centerX.rounded())), \(Int(viewState.centerZ.rounded()))). Loading \(pendingTileJobs.count) tile(s)…"
+                "Rendering seed \(displaySeed(seed)) at Y=\(currentSampleY), centered on (\(Int(viewState.centerX.rounded())), \(Int(viewState.centerZ.rounded()))). Loading \(pendingTileJobs.count) tile(s)…"
             )
             scheduleNextTileBatch()
         }
@@ -642,8 +617,15 @@ final class BrowserApp: DapperMapPlatform {
         let centerTileX = Int(floor(viewState.centerX / tileWorldSpan))
         let centerTileZ = Int(floor(viewState.centerZ / tileWorldSpan))
 
-        for tileZ in minTileZ...maxTileZ {
-            for tileX in minTileX...maxTileX {
+        let coordinates = MapMath.centerFirstTileCoordinates(
+            minTileX: minTileX,
+            maxTileX: maxTileX,
+            minTileZ: minTileZ,
+            maxTileZ: maxTileZ,
+            centerTileX: centerTileX,
+            centerTileZ: centerTileZ
+        )
+        for (tileX, tileZ) in coordinates {
                 let cacheKey = TileCacheKey(
                     seed: seed,
                     scaleKey: scaleKey,
@@ -666,17 +648,25 @@ final class BrowserApp: DapperMapPlatform {
                         )
                     )
                 }
-            }
         }
 
-        pendingTileJobs = missingJobs.sorted {
-            self.spiralSortKey(tileX: $0.tileX, tileZ: $0.tileZ, centerTileX: centerTileX, centerTileZ: centerTileZ)
-                < self.spiralSortKey(tileX: $1.tileX, tileZ: $1.tileZ, centerTileX: centerTileX, centerTileZ: centerTileZ)
+        pendingTileJobs = missingJobs
+        biomeTilesTotal = missingJobs.count
+        biomeTilesCompleted = 0
+        if missingJobs.isEmpty {
+            setBiomeGenerationStatus("Biomes: ready from tile cache.")
+        } else {
+            setBiomeGenerationStatus("Biomes: 0/\(missingJobs.count) tile(s) ready.")
+            setStructureGenerationStatus("Structures: waiting for biome tiles.")
         }
         updateDebugPanel()
     }
 
     private func scheduleNextTileBatch() {
+        if pendingTileJobs.isEmpty {
+            scheduleNextTileStructure()
+            return
+        }
         guard pendingTileTimer == nil else { return }
         pendingTileTimer = JSTimer(millisecondsDelay: 0) { [weak self] in
             self?.pendingTileTimer = nil
@@ -696,13 +686,107 @@ final class BrowserApp: DapperMapPlatform {
         let generator = self.tileGenerator
         inFlightTileTask = Task { [weak self] in
             do {
-                let result = try await generator.generate(workerJob)
+                let result = try await generator.generateBiomeTile(workerJob)
                 self?.handleGeneratedTile(result, for: workerJob)
             } catch {
                 self?.handleTileGenerationFailure(error, for: workerJob)
             }
         }
         updateDebugPanel()
+    }
+
+    private func scheduleNextTileStructure() {
+        guard pendingRenderTimer == nil else { return }
+        guard inFlightTileJob == nil, pendingTileJobs.isEmpty else { return }
+        guard inFlightTileStructureJob == nil else { return }
+        guard let seed = currentSeed else { return }
+        pendingTileStructureJobs.removeAll { $0.tileJob.seed != seed }
+        guard !pendingTileStructureJobs.isEmpty else {
+            setStructureGenerationStatus(
+                enabledStructureSetIDs().isEmpty ? "Structures: disabled." : "Structures: ready."
+            )
+            return
+        }
+
+        // Enrich current-view tiles before retained off-screen cache entries.
+        let index = pendingTileStructureJobs.firstIndex {
+            $0.tileJob.generation == activeViewGeneration
+        } ?? pendingTileStructureJobs.startIndex
+        let structureJob = pendingTileStructureJobs.remove(at: index)
+        inFlightTileStructureJob = structureJob
+        let currentRemaining = pendingTileStructureJobs.lazy.filter {
+            $0.tileJob.generation == self.activeViewGeneration
+        }.count + 1
+        setStructureGenerationStatus("Structures: generating \(currentRemaining) tile(s).")
+        let generator = tileGenerator
+        inFlightTileStructureTask = Task { [weak self] in
+            do {
+                let result = try await generator.generateStructures(
+                    for: structureJob.tileJob,
+                    biomeCache: structureJob.biomeCache
+                )
+                self?.handleGeneratedTileStructures(result, for: structureJob)
+            } catch {
+                self?.handleTileStructureFailure(error, for: structureJob)
+            }
+        }
+    }
+
+    private func handleGeneratedTileStructures(
+        _ result: StructureQueryResult?,
+        for structureJob: PendingTileStructureJob
+    ) {
+        inFlightTileStructureJob = nil
+        inFlightTileStructureTask = nil
+        let job = structureJob.tileJob
+        let key = TileCacheKey(
+            seed: job.seed,
+            scaleKey: scaleKey(for: job.tileBlocksPerPixel),
+            tileX: job.tileX,
+            tileZ: job.tileZ
+        )
+        if let existing = tileCache[key] {
+            tileCache[key] = CachedTile(
+                width: existing.width,
+                height: existing.height,
+                palette: existing.palette,
+                biomeIndices: existing.biomeIndices,
+                structurePoints: result?.points ?? [],
+                structureMetrics: result?.metrics ?? StructureProfilingMetrics()
+            )
+        }
+        if job.seed == currentSeed, let viewState = latestViewState {
+            refreshVisibleStructures(for: viewState)
+            drawGridOverlay(for: viewState)
+        }
+        let currentRemaining = pendingTileStructureJobs.lazy.filter {
+            $0.tileJob.generation == self.activeViewGeneration
+        }.count
+        setStructureGenerationStatus(
+            currentRemaining == 0
+                ? "Structures: ready."
+                : "Structures: \(currentRemaining) tile(s) remaining."
+        )
+        scheduleNextTileStructure()
+    }
+
+    private func handleTileStructureFailure(
+        _ error: Error,
+        for structureJob: PendingTileStructureJob
+    ) {
+        inFlightTileStructureJob = nil
+        inFlightTileStructureTask = nil
+        if error is CancellationError, structureJob.tileJob.seed == currentSeed {
+            pendingTileStructureJobs.append(structureJob)
+        } else if structureJob.tileJob.generation == activeViewGeneration {
+            setStructureSummary("Failed to locate structures: \(error)", isError: true)
+            setStructureGenerationStatus("Structures: failed — \(error)", isError: true)
+        }
+        if pendingTileJobs.isEmpty {
+            scheduleNextTileStructure()
+        } else {
+            scheduleNextTileBatch()
+        }
     }
 
     private func redrawTileIfCurrent(job: PendingTileJob) {
@@ -1021,6 +1105,16 @@ final class BrowserApp: DapperMapPlatform {
         statusElement.className = (isError ? "status error" : "status").jsValue
     }
 
+    private func setBiomeGenerationStatus(_ text: String, isError: Bool = false) {
+        biomeGenerationStatusElement.innerText = text.jsValue
+        biomeGenerationStatusElement.className = (isError ? "status error" : "status").jsValue
+    }
+
+    private func setStructureGenerationStatus(_ text: String, isError: Bool = false) {
+        structureGenerationStatusElement.innerText = text.jsValue
+        structureGenerationStatusElement.className = (isError ? "status error" : "status").jsValue
+    }
+
     private func updateDebugPanel() {
         if let tileX = tileDebugMetrics.tileX,
            let tileZ = tileDebugMetrics.tileZ,
@@ -1108,26 +1202,6 @@ final class BrowserApp: DapperMapPlatform {
         }
     }
 
-    private func spiralSortKey(tileX: Int, tileZ: Int, centerTileX: Int, centerTileZ: Int) -> (Int, Int, Int) {
-        let dx = tileX - centerTileX
-        let dz = tileZ - centerTileZ
-        let ring = max(abs(dx), abs(dz))
-        if ring == 0 {
-            return (0, 0, 0)
-        }
-
-        if dx == ring && dz > -ring {
-            return (ring, 0, dz + ring)
-        }
-        if dz == ring && dx < ring {
-            return (ring, 1, ring - dx)
-        }
-        if dx == -ring && dz < ring {
-            return (ring, 2, ring - dz)
-        }
-        return (ring, 3, dx + ring)
-    }
-
     private func scaleKey(for blocksPerPixel: Double) -> Int {
         Int((max(0.125, blocksPerPixel) * 1024.0).rounded())
     }
@@ -1171,30 +1245,30 @@ final class BrowserApp: DapperMapPlatform {
         }
     }
 
-    private func reloadStructureEditor(using dataPack: DataPack) {
-        let structureIDs = dataPack.structureSetRegistry.entries().map(\.key.name).sorted()
+    private func reloadStructureEditor(using structureSets: [BrowserStructureSetMetadata]) {
+        let structureIDs = structureSets.map(\.id)
         loadedStructureIDs = structureIDs
         let loadedStructureSet = Set(structureIDs)
         structureColors = structureColors.filter { loadedStructureSet.contains($0.key) }
         enabledStructureSets = enabledStructureSets.filter { loadedStructureSet.contains($0.key) }
         structureSetSpacings = [:]
         structureSetFrequencies.removeAll(keepingCapacity: true)
+        structureSetStructureIDs = Dictionary(
+            uniqueKeysWithValues: structureSets.map { ($0.id, $0.structureIDs) }
+        )
 
         for structureID in structureIDs where structureColors[structureID] == nil {
-            structureColors[structureID] = defaultStructureSetColor(for: structureID, using: dataPack)
+            structureColors[structureID] = defaultStructureSetColor(for: structureID)
         }
         for structureID in structureIDs where enabledStructureSets[structureID] == nil {
             enabledStructureSets[structureID] = true
         }
-        for entry in dataPack.structureSetRegistry.entries() {
-            guard let data = try? JSONEncoder().encode(entry.value),
-                  let encoded = try? JSONDecoder().decode(EncodedStructureSet.self, from: data)
-            else { continue }
-            if let spacing = encoded.placement.spacing {
-                structureSetSpacings[entry.key.name] = spacing
+        for structureSet in structureSets {
+            if let spacing = structureSet.spacing {
+                structureSetSpacings[structureSet.id] = spacing
             }
-            if encoded.placement.frequency != nil {
-                structureSetFrequencies.insert(entry.key.name)
+            if structureSet.hasFrequency {
+                structureSetFrequencies.insert(structureSet.id)
             }
         }
         renderStructureEditor()
@@ -1279,12 +1353,12 @@ final class BrowserApp: DapperMapPlatform {
     }
 
     private func resetStructureColorsToDefaults() {
-        guard !loadedStructureIDs.isEmpty, let dataPack else {
+        guard !loadedStructureIDs.isEmpty else {
             setStructureSummary("No structures are loaded.", isError: true)
             return
         }
         for structureID in loadedStructureIDs {
-            structureColors[structureID] = defaultStructureSetColor(for: structureID, using: dataPack)
+            structureColors[structureID] = defaultStructureSetColor(for: structureID)
             enabledStructureSets[structureID] = true
             syncStructureRow(for: structureID)
         }
@@ -1318,8 +1392,7 @@ final class BrowserApp: DapperMapPlatform {
         return BiomeColor(red: red, green: green, blue: blue)
     }
 
-    private func reloadBiomeEditor(using dataPack: DataPack) {
-        let biomeIDs = dataPack.biomeRegistry.entries().map(\.key.name).sorted()
+    private func reloadBiomeEditor(using biomeIDs: [String]) {
         loadedBiomeIDs = biomeIDs
 
         let loadedBiomeSet = Set(biomeIDs)
@@ -2157,11 +2230,8 @@ final class BrowserApp: DapperMapPlatform {
         return color
     }
 
-    private func defaultStructureSetColor(for structureSetID: String, using dataPack: DataPack) -> BiomeColor {
-        if let entry = dataPack.structureSetRegistry.entries().first(where: { $0.key.name == structureSetID }),
-           let data = try? JSONEncoder().encode(entry.value),
-           let encoded = try? JSONDecoder().decode(EncodedStructureSet.self, from: data),
-           let structureID = encoded.structures.map(\.structure).first(where: { vanillaStructureDefaults[$0] != nil }),
+    private func defaultStructureSetColor(for structureSetID: String) -> BiomeColor {
+        if let structureID = structureSetStructureIDs[structureSetID]?.first(where: { vanillaStructureDefaults[$0] != nil }),
            let color = vanillaStructureDefaults[structureID]
         {
             return color

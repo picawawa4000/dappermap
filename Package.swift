@@ -21,7 +21,13 @@ let package = Package(
     targets: [
         .target(
             name: "DapperMapCore",
-            path: "Sources/Common"
+            path: "Sources/Common",
+            swiftSettings: [
+                .unsafeFlags(
+                    ["-Osize", "-gnone"],
+                    .when(platforms: [.wasi], configuration: .release)
+                )
+            ]
         ),
         .systemLibrary(
             name: "SDL2",
@@ -36,11 +42,17 @@ let package = Package(
             dependencies: [
                 "DapperMapCore",
                 .product(name: "DPReader", package: "dpreader-swift"),
-                .product(name: "JavaScriptKit", package: "JavaScriptKit"),
-                .product(name: "JavaScriptEventLoop", package: "JavaScriptKit")
+                .product(name: "JavaScriptKit", package: "JavaScriptKit", condition: .when(platforms: [.wasi])),
+                .product(name: "JavaScriptEventLoop", package: "JavaScriptKit", condition: .when(platforms: [.wasi]))
             ],
             path: "Sources/App",
-            exclude: ["NativeAppController.swift", "NativeMapView.swift"]
+            exclude: ["NativeAppController.swift", "NativeMapView.swift"],
+            swiftSettings: [
+                .unsafeFlags(
+                    ["-Osize", "-gnone"],
+                    .when(platforms: [.wasi], configuration: .release)
+                )
+            ]
         ),
         .target(
             name: "DapperMapAppKit",
@@ -60,9 +72,9 @@ let package = Package(
             name: "dappermap",
             dependencies: [
                 "DapperMapEngine",
-                "DapperMapAppKit",
-                .product(name: "JavaScriptKit", package: "JavaScriptKit"),
-                .product(name: "JavaScriptEventLoop", package: "JavaScriptKit")
+                .target(name: "DapperMapAppKit", condition: .when(platforms: [.macOS])),
+                .product(name: "JavaScriptKit", package: "JavaScriptKit", condition: .when(platforms: [.wasi])),
+                .product(name: "JavaScriptEventLoop", package: "JavaScriptKit", condition: .when(platforms: [.wasi]))
             ],
             path: "Sources",
             exclude: ["App", "Common", "SDL", "benchstart"],
@@ -82,9 +94,9 @@ let package = Package(
                     [
                         "-Xlinker", "--strip-all",
                         // WebKit can retain stale bounds for a shared WASM memory while another
-                        // instance grows it. Keep tile generation below the initial allocation so
-                        // the main instance and its worker never have to coordinate a grow.
-                        "-Xlinker", "--initial-memory=134217728"
+                        // instance grows it. The UI and worker share this memory while the
+                        // datapack is decoded, so reserve enough for that peak and avoid grow.
+                        "-Xlinker", "--initial-memory=268435456"
                     ],
                     .when(platforms: [.wasi])
                 )
@@ -104,7 +116,7 @@ let package = Package(
         ),
         .testTarget(
             name: "DapperMapTests",
-            dependencies: ["DapperMapCore"],
+            dependencies: ["DapperMapCore", "DapperMapEngine"],
             path: "Tests"
         ),
     ]

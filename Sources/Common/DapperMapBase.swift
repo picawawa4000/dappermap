@@ -226,8 +226,14 @@ public final class DapperMapBase {
             SidebarTab(
                 id: "map",
                 title: "Map",
-                heading: "Seed",
-                fields: [SidebarField(id: "seed", label: "Seed Value", value: "0", kind: .text)]
+                heading: "Map",
+                fields: [
+                    SidebarField(id: "seed", label: "Seed", value: "0", kind: .text),
+                    SidebarField(id: "y", label: "Y", value: "256", kind: .text),
+                    SidebarField(id: "status", label: "Status", value: "Loading datapack…", kind: .text),
+                    SidebarField(id: "biome-status", label: "Biomes", value: "Waiting", kind: .text),
+                    SidebarField(id: "structure-status", label: "Structures", value: "Waiting", kind: .text)
+                ]
             ),
             SidebarTab(id: "biomes", title: "Biomes", heading: "Biomes", fields: []),
             SidebarTab(id: "structures", title: "Structures", heading: "Structures", fields: []),

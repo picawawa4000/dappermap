@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+# JavaScriptKit 0.56 invokes wasm-opt without the feature flags required by the
+# threaded WASI SDK. Keep this shim ahead of the real binary in build_web.sh.
+for candidate in /opt/homebrew/bin/wasm-opt /usr/local/bin/wasm-opt; do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" \
+            --enable-threads \
+            --enable-bulk-memory \
+            --enable-bulk-memory-opt \
+            --enable-nontrapping-float-to-int \
+            "$@"
+    fi
+done
+
+echo "error: install Binaryen (wasm-opt) before building the web release" >&2
+exit 1

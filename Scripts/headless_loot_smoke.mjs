@@ -40,7 +40,7 @@ socket.addEventListener("message", (event) => {
     }
     if (message.method === "Runtime.exceptionThrown") {
         diagnostics.push({ type: "exception", value: message.params.exceptionDetails });
-        console.error(`browser:exception:${message.params.exceptionDetails.text}`);
+        console.error(`browser:exception:${JSON.stringify(message.params.exceptionDetails)}`);
     } else if (message.method === "Runtime.consoleAPICalled") {
         const diagnostic = {
             type: `console.${message.params.type}`,
@@ -86,6 +86,13 @@ await command("Runtime.enable");
 await command("Log.enable");
 await command("Page.enable");
 await command("Inspector.enable");
+await waitFor(`document.readyState === "complete"`);
+console.error(`dom:${JSON.stringify(await evaluate(`({
+    status: Boolean(document.querySelector("#status")),
+    biomeGenerationStatus: Boolean(document.querySelector("#biome-generation-status")),
+    structureGenerationStatus: Boolean(document.querySelector("#structure-generation-status")),
+    currentStatus: document.querySelector("#status")?.innerText ?? ""
+})`))}`);
 console.error("waiting:datapack");
 await waitFor(`document.querySelector("#status")?.innerText === "Datapack ready. Enter a seed and click Render."`);
 console.error("ready:datapack");
@@ -134,6 +141,14 @@ await new Promise((resolve) => setTimeout(resolve, 10_000));
 await waitFor(`document.querySelector("#status")?.innerText.startsWith("Rendered seed ")`, 180_000);
 console.error(`status:${await evaluate(`document.querySelector("#status")?.innerText`)}`);
 console.error("ready:render");
+const generationStatuses = await waitFor(`(() => {
+    const biomes = document.querySelector("#biome-generation-status")?.innerText ?? "";
+    const structures = document.querySelector("#structure-generation-status")?.innerText ?? "";
+    return structures.startsWith("Structures: ready") || structures.startsWith("Structures: disabled")
+        ? { biomes, structures }
+        : null;
+})()`, 180_000);
+console.error(`ready:generation-statuses:${JSON.stringify(generationStatuses)}`);
 await command("Input.dispatchMouseEvent", { type: "mouseMoved", x: viewport.x, y: viewport.y });
 console.error("waiting:marker");
 const tooltip = await waitFor(`(() => {

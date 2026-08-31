@@ -19,23 +19,62 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     private let workers: [TileGenerationService]
     private var availableWorkers: [Int]
     private var waiters: [CheckedContinuation<Int, Never>] = []
+    private var initializedRootURL: URL?
+    private var initializingRootURL: URL?
+    private var initializationTask: Task<Void, Error>?
 
-    public init(threadCount: Int) {
+    public init(
+        threadCount: Int,
+        enableDensityCompilation: Bool = ProcessInfo.processInfo.environment["DAPPERMAP_ENABLE_LLVM"] == "1"
+    ) {
         let count = max(1, min(32, threadCount))
         workers = (0..<count).map { index in
-            TileGenerationService(samplingBackend: .scalar, prefersNativeCompilation: index == 0)
+            // DPReader's LLVM biome JIT takes roughly 14 seconds per shape and is intended for
+            // long batch jobs. Interactive AppKit/SDL views rarely amortize that setup cost.
+            TileGenerationService(
+                samplingBackend: .scalar,
+                prefersNativeCompilation: enableDensityCompilation && index == 0
+            )
         }
-        availableWorkers = Array(0..<count)
+        // `popLast()` should hand the first request to worker zero, the worker configured with
+        // LLVM bulk sampling, rather than to the highest-index scalar fallback.
+        availableWorkers = Array((0..<count).reversed())
     }
 
     public func initialize(rootURL: URL) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            for worker in workers {
-                group.addTask {
-                    try await worker.initialize(rootURL: rootURL)
+        let standardizedRootURL = rootURL.standardizedFileURL
+        guard initializedRootURL != standardizedRootURL else { return }
+        if initializingRootURL == standardizedRootURL, let initializationTask {
+            try await initializationTask.value
+            return
+        }
+        if let initializationTask {
+            try await initializationTask.value
+            if initializedRootURL == standardizedRootURL { return }
+        }
+
+        let workers = self.workers
+        let task = Task {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for worker in workers {
+                    group.addTask {
+                        try await worker.initialize(rootURL: standardizedRootURL)
+                    }
                 }
+                try await group.waitForAll()
             }
-            try await group.waitForAll()
+        }
+        initializingRootURL = standardizedRootURL
+        initializationTask = task
+        do {
+            try await task.value
+            initializedRootURL = standardizedRootURL
+            initializingRootURL = nil
+            initializationTask = nil
+        } catch {
+            initializingRootURL = nil
+            initializationTask = nil
+            throw error
         }
     }
 

@@ -40,16 +40,40 @@ enum TileGenerationExecutor {
 /// so the mutable buffer is only ever accessed by one tile request at a time.
 private final class ReusableBiomeTileSampler {
     let sampler: CompiledNoiseRouterBiomeBulkSampler
+    let palette: [String]
     private var output: [Int32]
 
     init(sampler: CompiledNoiseRouterBiomeBulkSampler) {
         self.sampler = sampler
+        palette = sampler.palette.map(\.name)
         output = [Int32](repeating: 0, count: sampler.bufferContext.sampleCount)
     }
 
     func biomeNames(at position: PosInt3D) -> [String] {
         output.withUnsafeMutableBufferPointer { sampler.fill(at: position, into: $0) }
-        return output.map { sampler.palette[Int($0)].name }
+        return output.map { palette[Int($0)] }
+    }
+
+    func tile(at position: PosInt3D) -> (palette: [String], indices: [UInt16]) {
+        output.withUnsafeMutableBufferPointer { sampler.fill(at: position, into: $0) }
+        var compactPalette = ["minecraft:plains"]
+        var compactIndexBySamplerIndex: [Int32: UInt16] = [:]
+        if let plainsIndex = palette.firstIndex(of: "minecraft:plains") {
+            compactIndexBySamplerIndex[Int32(plainsIndex)] = 0
+        }
+        var indices = [UInt16](repeating: 0, count: output.count)
+        for (outputIndex, samplerIndex) in output.enumerated() {
+            if let compactIndex = compactIndexBySamplerIndex[samplerIndex] {
+                indices[outputIndex] = compactIndex
+                continue
+            }
+            precondition(compactPalette.count <= Int(UInt16.max), "A tile contains too many biome types.")
+            let compactIndex = UInt16(compactPalette.count)
+            compactPalette.append(palette[Int(samplerIndex)])
+            compactIndexBySamplerIndex[samplerIndex] = compactIndex
+            indices[outputIndex] = compactIndex
+        }
+        return (compactPalette, indices)
     }
 }
 
@@ -75,8 +99,11 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private var samplers: [TileSamplerKey: ReusableBiomeTileSampler] = [:]
     private var structureSampler: StructurePlacementSampler?
     private var structureSetDescriptors: [StructureSetDescriptor] = []
-    private var validatedStructureStarts: [String: String] = [:]
-    private var rejectedStructureStarts: Set<String> = []
+    private var validatedStructureStarts: [StructureValidationKey: String] = [:]
+    private var rejectedStructureStarts: Set<StructureValidationKey> = []
+    private var randomStructurePlacements: [RandomStructureRegionKey: StructurePlacementSample] = [:]
+    private var emptyRandomStructureRegions: Set<RandomStructureRegionKey> = []
+    private var concentricStructurePlacements: [String: [StructurePlacementSample]] = [:]
     private var structureHeightmapSampler: GeneratedStructureHeightmapSampler?
     private var dataPackRoot: URL?
     nonisolated var unownedExecutor: UnownedSerialExecutor {
@@ -102,8 +129,11 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private var samplers: [TileSamplerKey: ReusableBiomeTileSampler] = [:]
     private var structureSampler: StructurePlacementSampler?
     private var structureSetDescriptors: [StructureSetDescriptor] = []
-    private var validatedStructureStarts: [String: String] = [:]
-    private var rejectedStructureStarts: Set<String> = []
+    private var validatedStructureStarts: [StructureValidationKey: String] = [:]
+    private var rejectedStructureStarts: Set<StructureValidationKey> = []
+    private var randomStructurePlacements: [RandomStructureRegionKey: StructurePlacementSample] = [:]
+    private var emptyRandomStructureRegions: Set<RandomStructureRegionKey> = []
+    private var concentricStructurePlacements: [String: [StructurePlacementSample]] = [:]
     private var structureHeightmapSampler: GeneratedStructureHeightmapSampler?
     private var dataPackRoot: URL?
 
@@ -187,7 +217,8 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             let sampleScale = max(1, Int32((Double(tileSpan) / 128.0).rounded()))
             let sampleWidth = max(1, Int((tileSpan + sampleScale - 1) / sampleScale))
             let key = TileSamplerKey(
-                sampleWidth: Int32(sampleWidth), sampleHeight: Int32(sampleWidth), sampleYCount: 1, sampleScale: sampleScale
+                sampleWidth: Int32(sampleWidth), sampleHeight: Int32(sampleWidth), sampleYCount: 1,
+                sampleScale: sampleScale, sampleYStep: 1
             )
             if samplers[key] != nil { continue }
             let compiled = try generator.makeBiomeIDBulkSampler(
@@ -200,6 +231,17 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             )
             samplers[key] = ReusableBiomeTileSampler(sampler: compiled)
         }
+        // Structure validation asks for exact quart-aligned positions after resolving terrain
+        // height. Precompile that tiny shape so the first structure does not invoke the compiler.
+        _ = try compiledBiomeSampler(
+            using: generator,
+            sampleWidth: 1,
+            sampleHeight: 1,
+            sampleYCount: 1,
+            sampleScale: 4,
+            sampleYStep: 4,
+            strategy: strategy
+        )
         // Force DPReader's cached full-chunk terrain program as well. Structure-start heightmap
         // validation shares this program, so otherwise its first candidate pays the compile cost.
         let warmupChunk = ProtoChunk()
@@ -214,14 +256,33 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         )
     }
 
-    func generate(_ job: PendingTileJob) throws -> GeneratedTile {
+    func browserRegistryMetadata() -> BrowserRegistryMetadata {
+        BrowserRegistryMetadata(
+            biomeIDs: dataPack?.biomeRegistry.entries().map(\.key.name).sorted() ?? [],
+            structureSets: structureSetDescriptors
+                .map {
+                    BrowserStructureSetMetadata(
+                        id: $0.keyName,
+                        spacing: $0.spacing,
+                        hasFrequency: $0.frequency != nil,
+                        structureIDs: $0.structureIDs
+                    )
+                }
+                .sorted { $0.id < $1.id }
+        )
+    }
+
+    /// Generate the paintable part of a tile. Browser callers use this entry point so structure
+    /// discovery cannot delay the first pixels; native callers continue through `generate`.
+    func generateBiomeTile(_ job: PendingTileJob) throws -> GeneratedTile {
         guard let dataPack else {
             throw BrowserAppError.message("Tile generation worker is not ready.")
         }
 
-        try configureGenerator(for: job.seed, using: dataPack)
-
         let start = Date()
+        try configureGenerator(for: job.seed, using: dataPack)
+        try Task.checkCancellation()
+
         let generated = try makeTile(
             using: generator!,
             blocksPerPixel: job.tileBlocksPerPixel,
@@ -229,19 +290,21 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             tileZ: job.tileZ,
             sampleY: job.sampleY
         )
-        let structureQuery = StructureQuery(
-            seed: job.seed,
-            minX: generated.biomeCache.usableMinX,
-            maxX: generated.biomeCache.usableMaxX,
-            minZ: generated.biomeCache.usableMinZ,
-            maxZ: generated.biomeCache.usableMaxZ,
-            enabledStructureSets: job.enabledStructureSets ?? Set(structureSetDescriptors.map(\.keyName)),
-            minimumSpacingBlocks: Double(tileSize) * job.tileBlocksPerPixel / 8.0
+        try Task.checkCancellation()
+        return GeneratedTile(
+            tile: generated.tile,
+            biomeCache: generated.biomeCache,
+            generationMilliseconds: Date().timeIntervalSince(start) * 1_000.0,
+            densityCompilationMilliseconds: densityCompilationMilliseconds,
+            densityCompilationBackend: densityCompilationBackend
         )
-        let structures = try structures(
-            in: structureQuery,
-            biomeSampler: generated.biomeCache.biome(at:)
-        )
+    }
+
+    func generate(_ job: PendingTileJob) throws -> GeneratedTile {
+        let start = Date()
+        let generated = try generateBiomeTile(job)
+        guard let biomeCache = generated.biomeCache else { return generated }
+        let structures = try generateStructures(for: job, biomeCache: biomeCache)
         let tile = CachedTile(
             width: generated.tile.width,
             height: generated.tile.height,
@@ -252,9 +315,31 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         )
         return GeneratedTile(
             tile: tile,
+            biomeCache: nil,
             generationMilliseconds: Date().timeIntervalSince(start) * 1_000.0,
-            densityCompilationMilliseconds: densityCompilationMilliseconds,
-            densityCompilationBackend: densityCompilationBackend
+            densityCompilationMilliseconds: generated.densityCompilationMilliseconds,
+            densityCompilationBackend: generated.densityCompilationBackend
+        )
+    }
+
+    func generateStructures(
+        for job: PendingTileJob,
+        biomeCache: TileBiomeCache
+    ) throws -> StructureQueryResult? {
+        try Task.checkCancellation()
+        let structureQuery = StructureQuery(
+            seed: job.seed,
+            minX: biomeCache.usableMinX,
+            maxX: biomeCache.usableMaxX,
+            minZ: biomeCache.usableMinZ,
+            maxZ: biomeCache.usableMaxZ,
+            enabledStructureSets: job.enabledStructureSets ?? Set(structureSetDescriptors.map(\.keyName)),
+            minimumSpacingBlocks: Double(tileSize) * job.tileBlocksPerPixel / 8.0
+        )
+        guard !structureQuery.enabledStructureSets.isEmpty else { return nil }
+        return try structures(
+            in: structureQuery,
+            biomeSampler: biomeCache.biome(at:)
         )
     }
 
@@ -342,6 +427,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
 
         var points = Set<StructurePoint>()
         for descriptor in structureSetDescriptors where query.enabledStructureSets.contains(descriptor.keyName) {
+            try Task.checkCancellation()
             let samples: [StructurePlacementSample]
             switch descriptor.kind {
             case .randomSpread:
@@ -371,13 +457,27 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 var generated: [StructurePlacementSample] = []
                 let samplingStart = Date()
                 for regionZ in minRegionZ...maxRegionZ {
+                    try Task.checkCancellation()
                     for regionX in minRegionX...maxRegionX {
-                        if let sample = try structureSampler.sampleStructureSet(
-                            inRegion: PosInt2D(x: regionX, z: regionZ),
-                            for: RegistryKey(referencing: descriptor.keyName)
-                        ) {
+                        let cacheKey = RandomStructureRegionKey(
+                            setID: descriptor.keyName,
+                            regionX: regionX,
+                            regionZ: regionZ
+                        )
+                        if let sample = randomStructurePlacements[cacheKey] {
                             generated.append(sample)
                             metrics.candidates += 1
+                        } else if !emptyRandomStructureRegions.contains(cacheKey) {
+                            if let sample = try structureSampler.sampleStructureSet(
+                                inRegion: PosInt2D(x: regionX, z: regionZ),
+                                for: RegistryKey(referencing: descriptor.keyName)
+                            ) {
+                                randomStructurePlacements[cacheKey] = sample
+                                generated.append(sample)
+                                metrics.candidates += 1
+                            } else {
+                                emptyRandomStructureRegions.insert(cacheKey)
+                            }
                         }
                     }
                 }
@@ -388,15 +488,22 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 // spread placements so strongholds are retained in the tile cache and use the
                 // already-generated biome sampler for validation.
                 let samplingStart = Date()
-                samples = try structureSampler.sampleAllPlacements(
-                    for: RegistryKey(referencing: descriptor.keyName)
-                )
+                if let cached = concentricStructurePlacements[descriptor.keyName] {
+                    samples = cached
+                } else {
+                    let generated = try structureSampler.sampleAllPlacements(
+                        for: RegistryKey(referencing: descriptor.keyName)
+                    )
+                    concentricStructurePlacements[descriptor.keyName] = generated
+                    samples = generated
+                }
                 metrics.samplingMilliseconds += Date().timeIntervalSince(samplingStart) * 1_000.0
                 metrics.candidates += samples.count
             }
 
             let validationStart = Date()
             for sample in samples where pointIsVisible(sample.blockPos, in: query) {
+                try Task.checkCancellation()
                 // Monument validation scans a 59×59×59 biome volume. Most random-spread
                 // candidates are not even in a deep ocean, so reject those before asking the
                 // placement sampler to perform its authoritative surrounding-ocean check.
@@ -410,7 +517,11 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                           try structureSampler.resolveStructure(for: sample, biome: biome) != nil
                     else { continue }
                 }
-                let validationKey = "\(descriptor.keyName):\(sample.chunkPos.x),\(sample.chunkPos.z)"
+                let validationKey = StructureValidationKey(
+                    setID: descriptor.keyName,
+                    chunkX: sample.chunkPos.x,
+                    chunkZ: sample.chunkPos.z
+                )
                 let structureID: String
                 if let cached = validatedStructureStarts[validationKey] {
                     metrics.cacheHits += 1
@@ -484,14 +595,25 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         for descriptor in structureSetDescriptors
         where descriptor.kind == .concentricRings && query.enabledStructureSets.contains(descriptor.keyName) {
             let samplingStart = Date()
-            let samples = try structureSampler.sampleAllPlacements(
-                for: RegistryKey(referencing: descriptor.keyName)
-            )
+            let samples: [StructurePlacementSample]
+            if let cached = concentricStructurePlacements[descriptor.keyName] {
+                samples = cached
+            } else {
+                let generated = try structureSampler.sampleAllPlacements(
+                    for: RegistryKey(referencing: descriptor.keyName)
+                )
+                concentricStructurePlacements[descriptor.keyName] = generated
+                samples = generated
+            }
             metrics.samplingMilliseconds += Date().timeIntervalSince(samplingStart) * 1_000.0
             metrics.candidates += samples.count
             let validationStart = Date()
             for sample in samples where pointIsVisible(sample.blockPos, in: query) {
-                let validationKey = "\(descriptor.keyName):\(sample.chunkPos.x),\(sample.chunkPos.z)"
+                let validationKey = StructureValidationKey(
+                    setID: descriptor.keyName,
+                    chunkX: sample.chunkPos.x,
+                    chunkZ: sample.chunkPos.z
+                )
                 let structureID: String
                 if let cached = validatedStructureStarts[validationKey] {
                     metrics.cacheHits += 1
@@ -772,10 +894,16 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 // DPReader retains compiled graphs and search trees across seed changes.
                 try generator.setWorldSeed(seed)
                 currentSeed = seed
-                samplers.removeAll(keepingCapacity: true)
+                // Bulk samplers are also seed-stable compiled programs.  Their retained
+                // instances are updated by setWorldSeed; throwing them away here defeats the
+                // startup prewarm and makes the first tile for every new window pay compilation
+                // again.
                 structureSampler = StructurePlacementSampler(withWorldSeed: seed, usingDataPacks: [dataPack])
                 validatedStructureStarts.removeAll(keepingCapacity: true)
                 rejectedStructureStarts.removeAll(keepingCapacity: true)
+                randomStructurePlacements.removeAll(keepingCapacity: true)
+                emptyRandomStructureRegions.removeAll(keepingCapacity: true)
+                concentricStructurePlacements.removeAll(keepingCapacity: true)
                 structureHeightmapSampler = nil
             } else {
                 return
@@ -856,6 +984,9 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             structureSampler = StructurePlacementSampler(withWorldSeed: seed, usingDataPacks: [dataPack])
             validatedStructureStarts.removeAll(keepingCapacity: true)
             rejectedStructureStarts.removeAll(keepingCapacity: true)
+            randomStructurePlacements.removeAll(keepingCapacity: true)
+            emptyRandomStructureRegions.removeAll(keepingCapacity: true)
+            concentricStructurePlacements.removeAll(keepingCapacity: true)
             structureHeightmapSampler = nil
         }
     }
@@ -892,18 +1023,24 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         )
     }
 
-    private func compiledBiomeNames(
+    private func compiledBiomeSampler(
         using generator: WorldGenerator,
         sampleWidth: Int32,
         sampleHeight: Int32,
         sampleYCount: Int32 = 1,
         sampleScale: Int32,
-        at position: PosInt3D,
+        sampleYStep: Int32 = 1,
         strategy: CompilationBackend
-    ) throws -> [String] {
+    ) throws -> ReusableBiomeTileSampler {
         // The key includes both fixed shape and stride, matching DPReader's retained-sampler
         // contract. The associated output buffer is reused for every subsequent tile.
-        let key = TileSamplerKey(sampleWidth: sampleWidth, sampleHeight: sampleHeight, sampleYCount: sampleYCount, sampleScale: sampleScale)
+        let key = TileSamplerKey(
+            sampleWidth: sampleWidth,
+            sampleHeight: sampleHeight,
+            sampleYCount: sampleYCount,
+            sampleScale: sampleScale,
+            sampleYStep: sampleYStep
+        )
         let sampler: ReusableBiomeTileSampler
         if let existing = samplers[key] {
             sampler = existing
@@ -911,7 +1048,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             let compiled = try generator.makeBiomeIDBulkSampler(
                 for: CompiledDensityFunctionBufferContext(
                     xCount: sampleWidth, yCount: sampleYCount, zCount: sampleHeight,
-                    xStep: sampleScale, yStep: 1, zStep: sampleScale
+                    xStep: sampleScale, yStep: sampleYStep, zStep: sampleScale
                 ),
                 in: overworldDimension,
                 strategy: strategy
@@ -919,7 +1056,28 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             sampler = ReusableBiomeTileSampler(sampler: compiled)
             samplers[key] = sampler
         }
-        return sampler.biomeNames(at: position)
+        return sampler
+    }
+
+    private func compiledBiomeNames(
+        using generator: WorldGenerator,
+        sampleWidth: Int32,
+        sampleHeight: Int32,
+        sampleYCount: Int32 = 1,
+        sampleScale: Int32,
+        sampleYStep: Int32 = 1,
+        at position: PosInt3D,
+        strategy: CompilationBackend
+    ) throws -> [String] {
+        try compiledBiomeSampler(
+            using: generator,
+            sampleWidth: sampleWidth,
+            sampleHeight: sampleHeight,
+            sampleYCount: sampleYCount,
+            sampleScale: sampleScale,
+            sampleYStep: sampleYStep,
+            strategy: strategy
+        ).biomeNames(at: position)
     }
 
     private func makeTile(
@@ -937,27 +1095,26 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         let sampleWidth = max(1, Int((tileSpan + sampleScale - 1) / sampleScale))
         let startX = Int32(tileX) &* tileSpan
         let startZ = Int32(tileZ) &* tileSpan
-        let biomeIDs: [String]
+        let palette: [String]
+        let indices: [UInt16]
         switch samplingBackend {
         case .nestedWASM:
-            biomeIDs = try compiledBiomeNames(
+            (palette, indices) = try compiledBiomeSampler(
                 using: generator,
                 sampleWidth: Int32(sampleWidth),
                 sampleHeight: Int32(sampleWidth),
                 sampleScale: sampleScale,
-                at: PosInt3D(x: startX, y: sampleY, z: startZ),
                 strategy: .wasm
-            )
+            ).tile(at: PosInt3D(x: startX, y: sampleY, z: startZ))
         case .scalar:
             if usesNativeBulkSampler {
-                biomeIDs = try compiledBiomeNames(
+                (palette, indices) = try compiledBiomeSampler(
                     using: generator,
                     sampleWidth: Int32(sampleWidth),
                     sampleHeight: Int32(sampleWidth),
                     sampleScale: sampleScale,
-                    at: PosInt3D(x: startX, y: sampleY, z: startZ),
                     strategy: .llvm
-                )
+                ).tile(at: PosInt3D(x: startX, y: sampleY, z: startZ))
             } else {
                 let extent = Int32(sampleWidth) * sampleScale
                 guard let biomes = try generator.generateBiomesInSquare(
@@ -970,23 +1127,24 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 ) else {
                     throw BrowserAppError.message("The overworld biome sampler returned no data.")
                 }
-                biomeIDs = biomes.map(\.name)
-            }
-        }
-
-        var palette = ["minecraft:plains"]
-        var paletteIndices = ["minecraft:plains": UInt16(0)]
-        var indices = [UInt16](repeating: 0, count: biomeIDs.count)
-        for (index, biomeID) in biomeIDs.enumerated() {
-            let paletteIndex = paletteIndices[biomeID] ?? UInt16(palette.count)
-            if paletteIndices[biomeID] == nil {
-                guard palette.count <= Int(UInt16.max) else {
-                    throw BrowserAppError.message("A tile contains too many biome types.")
+                var scalarPalette = ["minecraft:plains"]
+                var paletteIndices = ["minecraft:plains": UInt16(0)]
+                var scalarIndices = [UInt16](repeating: 0, count: biomes.count)
+                for (index, biome) in biomes.enumerated() {
+                    let biomeID = biome.name
+                    let paletteIndex = paletteIndices[biomeID] ?? UInt16(scalarPalette.count)
+                    if paletteIndices[biomeID] == nil {
+                        guard scalarPalette.count <= Int(UInt16.max) else {
+                            throw BrowserAppError.message("A tile contains too many biome types.")
+                        }
+                        scalarPalette.append(biomeID)
+                        paletteIndices[biomeID] = paletteIndex
+                    }
+                    scalarIndices[index] = paletteIndex
                 }
-                palette.append(biomeID)
-                paletteIndices[biomeID] = paletteIndex
+                palette = scalarPalette
+                indices = scalarIndices
             }
-            indices[index] = paletteIndex
         }
 
         // Structure validation is quart-aligned and may inspect a 29-block radius around an
@@ -996,8 +1154,8 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         let structureMinY: Int32 = -64
         let structureYCount: Int32 = 96
         let structureMargin: Int32 = 32
-        // Lazy per-column caching avoids the former 3D allocation, so structure sampling can
-        // cover the complete visible tile at every zoom level.
+        // Exact-position caching avoids sampling 96 vertical biomes when validation only needs
+        // the biome at its already-resolved generation height.
         let sampledStructureSpan = tileSpan
         let sampledStructureOriginX = startX &+ (tileSpan &- sampledStructureSpan) / 2
         let sampledStructureOriginZ = startZ &+ (tileSpan &- sampledStructureSpan) / 2
@@ -1015,19 +1173,23 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             height: structureHeight,
             minY: structureMinY,
             yCount: Int(structureYCount)
-        ) { [self] x, z in
+        ) { [self] position in
             switch samplingBackend {
             case .nestedWASM:
-                return try compiledBiomeNames(using: generator, sampleWidth: 1, sampleHeight: 1, sampleYCount: structureYCount, sampleScale: structureScale, at: PosInt3D(x: x, y: structureMinY, z: z), strategy: .wasm)
-            case .scalar where usesNativeBulkSampler:
-                return try compiledBiomeNames(using: generator, sampleWidth: 1, sampleHeight: 1, sampleYCount: structureYCount, sampleScale: structureScale, at: PosInt3D(x: x, y: structureMinY, z: z), strategy: .llvm)
-            case .scalar:
-                return try (0..<structureYCount).map { yOffset in
-                    guard let biome = try generator.generateBiomesInSquare(from: PosInt2D(x: x, z: z), to: PosInt2D(x: x &+ structureScale, z: z &+ structureScale), atY: structureMinY &+ yOffset &* 4, in: overworldDimension, scale: structureScale)?.first else {
-                        throw BrowserAppError.message("The overworld structure biome sampler returned no data.")
-                    }
-                    return biome.name
+                guard let biome = try compiledBiomeNames(using: generator, sampleWidth: 1, sampleHeight: 1, sampleYCount: 1, sampleScale: structureScale, sampleYStep: 4, at: position, strategy: .wasm).first else {
+                    throw BrowserAppError.message("The overworld structure biome sampler returned no data.")
                 }
+                return biome
+            case .scalar where usesNativeBulkSampler:
+                guard let biome = try compiledBiomeNames(using: generator, sampleWidth: 1, sampleHeight: 1, sampleYCount: 1, sampleScale: structureScale, sampleYStep: 4, at: position, strategy: .llvm).first else {
+                    throw BrowserAppError.message("The overworld structure biome sampler returned no data.")
+                }
+                return biome
+            case .scalar:
+                guard let biome = try generator.sampleBiome(at: position, in: overworldDimension) else {
+                    throw BrowserAppError.message("The overworld structure biome sampler returned no data.")
+                }
+                return biome.name
             }
         }
         let tile = CachedTile(
