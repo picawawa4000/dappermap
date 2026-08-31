@@ -16,6 +16,7 @@
 .loot-container { border: 1px solid var(--line); border-radius: .7rem; background: #fffdf7; overflow: hidden; }
 .loot-container summary { padding: .7rem .8rem; background: #f0eee4; font: .8rem ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
 .loot-items { margin: 0; padding: .7rem 1rem .8rem 2.2rem; display: grid; gap: .25rem; font: .82rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+.loot-item-match { margin: -.1rem -.25rem; padding: .1rem .25rem; border-radius: .25rem; background: #ffe28a; color: #513700; font-weight: 700; }
 .map-tooltip {
   z-index: 10;
   max-width: min(24rem, calc(100% - 1.5rem));

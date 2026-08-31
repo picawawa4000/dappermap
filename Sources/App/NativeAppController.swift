@@ -17,7 +17,7 @@ import WASILibc
 #endif
 #if !os(WASI) && canImport(AppKit)
 @MainActor
-final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDelegate {
+final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDelegate, NSTextFieldDelegate {
     let window: NSWindow
     private let mapView = NativeMapView(frame: .zero)
     private let sidebar = NSView(frame: .zero)
@@ -35,7 +35,11 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
     private var biomeColors: [String: BiomeColor] = [:]
     private var structureColors: [String: BiomeColor] = [:]
     private var enabledStructureSets: Set<String> = []
+    private var lootFilterInput: NSTextField?
     private var lootText: NSTextView?
+    private var lootContainers: [MapLootPresentation] = []
+    private var lootMessage: String?
+    private var lootMessageIsError = false
     private var debugLabel: NSTextField?
     private var threadField: NSTextField?
     private var threadStepper: NSStepper?
@@ -177,14 +181,10 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
     func render(loot: [MapLootPresentation], message: String?, isError: Bool) {
         mapView.lootContainers = loot
         mapView.needsDisplay = true
-        var sections: [String] = []
-        if let message { sections.append(message) }
-        sections += loot.map { container in
-            let items = container.items.isEmpty ? "  No resolved items" : container.items.map { "  • \($0)" }.joined(separator: "\n")
-            return "\(container.block) at (\(container.x), \(container.y), \(container.z))\n\(items)"
-        }
-        lootText?.string = sections.joined(separator: "\n\n")
-        lootText?.textColor = isError ? .systemRed : .labelColor
+        lootContainers = loot
+        lootMessage = message
+        lootMessageIsError = isError
+        renderLootText()
         showTab("loot")
     }
 
@@ -297,6 +297,15 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
                 helpLabel.widthAnchor.constraint(equalToConstant: 324).isActive = true
                 stack.addArrangedSubview(helpLabel)
             }
+            stack.addArrangedSubview(label("Filter item", size: 12, bold: true))
+            let filter = NSTextField()
+            filter.placeholderString = "e.g. diamond"
+            filter.target = self
+            filter.action = #selector(lootFilterChanged(_:))
+            filter.delegate = self
+            filter.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            stack.addArrangedSubview(filter)
+            lootFilterInput = filter
             let scroll = NSScrollView()
             scroll.hasVerticalScroller = true
             scroll.borderType = .bezelBorder
@@ -479,6 +488,65 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             enabledStructureSets.remove(id)
         }
         mapView.enabledStructureSets = enabledStructureSets
+    }
+
+    @objc private func lootFilterChanged(_ sender: NSTextField) {
+        renderLootText()
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField, field === lootFilterInput else { return }
+        renderLootText()
+    }
+
+    private func renderLootText() {
+        guard let lootText else { return }
+        let filter = lootFilterInput?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let matchingContainers = filter.isEmpty
+            ? lootContainers
+            : lootContainers.filter { container in
+                container.items.contains { $0.lowercased().contains(filter) }
+            }
+
+        let normalFont = NSFont(name: "Menlo", size: 11) ?? .monospacedSystemFont(ofSize: 11, weight: .regular)
+        let result = NSMutableAttributedString()
+        if let lootMessage {
+            result.append(NSAttributedString(
+                string: "\(lootMessage)\n\n",
+                attributes: [.font: normalFont, .foregroundColor: lootMessageIsError ? NSColor.systemRed : NSColor.labelColor]
+            ))
+        }
+        if !filter.isEmpty && matchingContainers.isEmpty {
+            result.append(NSAttributedString(
+                string: "No containers contain \(lootFilterInput?.stringValue ?? filter).",
+                attributes: [.font: normalFont, .foregroundColor: NSColor.secondaryLabelColor]
+            ))
+        }
+        for (containerIndex, container) in matchingContainers.enumerated() {
+            if containerIndex > 0 { result.append(NSAttributedString(string: "\n\n")) }
+            result.append(NSAttributedString(
+                string: "\(container.block) at (\(container.x), \(container.y), \(container.z))\n",
+                attributes: [.font: normalFont, .foregroundColor: NSColor.labelColor]
+            ))
+            if container.items.isEmpty {
+                result.append(NSAttributedString(
+                    string: "  No resolved items",
+                    attributes: [.font: normalFont, .foregroundColor: NSColor.secondaryLabelColor]
+                ))
+            }
+            for item in container.items {
+                let isMatch = !filter.isEmpty && item.lowercased().contains(filter)
+                result.append(NSAttributedString(
+                    string: "  • \(item)\n",
+                    attributes: [
+                        .font: normalFont,
+                        .foregroundColor: isMatch ? NSColor.black : NSColor.labelColor,
+                        .backgroundColor: isMatch ? NSColor.systemYellow.withAlphaComponent(0.6) : NSColor.clear
+                    ]
+                ))
+            }
+        }
+        lootText.textStorage?.setAttributedString(result)
     }
 
     private func biomeColor(from color: NSColor) -> BiomeColor {

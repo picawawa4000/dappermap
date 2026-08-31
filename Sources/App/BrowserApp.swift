@@ -38,6 +38,7 @@ final class BrowserApp: DapperMapPlatform {
     private let structureEmptyElement: JSObject
     private let structureListElement: JSObject
     private let lootInfoElement: JSObject
+    private let lootFilterInput: JSObject
     private let lootMessageElement: JSObject
     private let lootListElement: JSObject
     private let debugLastTileElement: JSObject
@@ -106,6 +107,7 @@ final class BrowserApp: DapperMapPlatform {
     private var loadedStructureIDs: [String] = []
     private var visibleStructurePoints: [StructurePoint] = []
     private var visibleLootContainers: [LootContainerPoint] = []
+    private var lootFilter = ""
     private var activeLootStructure: StructurePoint?
     private var activeLootRequest = 0
     private var lootContainerDetails: [LootContainerPoint: JSObject] = [:]
@@ -153,6 +155,7 @@ final class BrowserApp: DapperMapPlatform {
         self.structureEmptyElement = document.getElementById!("structure-empty").object!
         self.structureListElement = document.getElementById!("structure-list").object!
         self.lootInfoElement = document.getElementById!("loot-info").object!
+        self.lootFilterInput = document.getElementById!("loot-filter-input").object!
         self.lootMessageElement = document.getElementById!("loot-message").object!
         self.lootListElement = document.getElementById!("loot-list").object!
         self.debugLastTileElement = document.getElementById!("debug-last-tile").object!
@@ -316,6 +319,15 @@ final class BrowserApp: DapperMapPlatform {
         }
         retainedClosures.append(structureResetClosure)
         _ = structureResetButton.addEventListener!("click", structureResetClosure)
+
+        let lootFilterClosure = JSClosure { [weak self] _ in
+            guard let self else { return .undefined }
+            self.lootFilter = self.lootFilterInput.value.string ?? ""
+            self.renderLootPanel(message: nil)
+            return .undefined
+        }
+        retainedClosures.append(lootFilterClosure)
+        _ = lootFilterInput.addEventListener!("input", lootFilterClosure)
 
         let biomeImportButtonClosure = JSClosure { [weak self] _ in
             self?.biomeImportInput.value = "".jsValue
@@ -2031,7 +2043,20 @@ final class BrowserApp: DapperMapPlatform {
         lootMessageElement.hidden = (message == nil).jsValue
         lootMessageElement.className = (isError ? "status error" : "status").jsValue
         guard !visibleLootContainers.isEmpty else { return }
-        for container in visibleLootContainers {
+        let normalizedFilter = lootFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let filteredContainers = normalizedFilter.isEmpty
+            ? visibleLootContainers
+            : visibleLootContainers.filter { container in
+                container.loot.contains { $0.lowercased().contains(normalizedFilter) }
+            }
+        if filteredContainers.isEmpty {
+            let empty = document.createElement!("p").object!
+            empty.className = "status".jsValue
+            empty.innerText = "No containers contain \(lootFilter).".jsValue
+            _ = lootListElement.appendChild!(empty)
+            return
+        }
+        for container in filteredContainers {
             let details = document.createElement!("details").object!
             details.className = "loot-container".jsValue
             let summary = document.createElement!("summary").object!
@@ -2042,6 +2067,9 @@ final class BrowserApp: DapperMapPlatform {
             for item in container.loot {
                 let row = document.createElement!("li").object!
                 row.innerText = item.jsValue
+                if !normalizedFilter.isEmpty, item.lowercased().contains(normalizedFilter) {
+                    row.className = "loot-item-match".jsValue
+                }
                 _ = items.appendChild!(row)
             }
             if container.loot.isEmpty {
