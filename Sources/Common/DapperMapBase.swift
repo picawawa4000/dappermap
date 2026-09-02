@@ -152,9 +152,10 @@ public struct MapTileRequest: Sendable {
     public let tileX: Int
     public let tileZ: Int
     public let sampleY: Int32
+    public let dimensionID: String
     public let enabledStructureSets: Set<String>?
 
-    public init(generation: Int, seed: Int64, centerX: Double, centerZ: Double, blocksPerPixel: Double, viewportWidth: Int, viewportHeight: Int, tileBlocksPerPixel: Double, tileX: Int, tileZ: Int, sampleY: Int32 = 256, enabledStructureSets: Set<String>? = nil) {
+    public init(generation: Int, seed: Int64, centerX: Double, centerZ: Double, blocksPerPixel: Double, viewportWidth: Int, viewportHeight: Int, tileBlocksPerPixel: Double, tileX: Int, tileZ: Int, sampleY: Int32 = 256, dimensionID: String = "minecraft:overworld", enabledStructureSets: Set<String>? = nil) {
         self.generation = generation
         self.seed = seed
         self.centerX = centerX
@@ -166,6 +167,7 @@ public struct MapTileRequest: Sendable {
         self.tileX = tileX
         self.tileZ = tileZ
         self.sampleY = sampleY
+        self.dimensionID = dimensionID
         self.enabledStructureSets = enabledStructureSets
     }
 }
@@ -229,6 +231,7 @@ public final class DapperMapBase {
                 heading: "Map",
                 fields: [
                     SidebarField(id: "seed", label: "Seed", value: "0", kind: .text),
+                    SidebarField(id: "dimension", label: "Dimension", value: "minecraft:overworld", kind: .text),
                     SidebarField(id: "y", label: "Y", value: "256", kind: .text),
                     SidebarField(id: "status", label: "Status", value: "Loading datapack…", kind: .text),
                     SidebarField(id: "biome-status", label: "Biomes", value: "Waiting", kind: .text),

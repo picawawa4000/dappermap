@@ -20,6 +20,7 @@ final class BrowserApp: DapperMapPlatform {
     private let document: JSObject
     private let viewport: JSObject
     private let seedInput: JSObject
+    private let dimensionInput: JSObject
     private let yInput: JSObject
     private let renderButton: JSObject
     private let statusElement: JSObject
@@ -70,6 +71,7 @@ final class BrowserApp: DapperMapPlatform {
     private var generatorReady = false
     private var currentSeed: WorldSeed?
     private var currentSampleY: Int32 = defaultSampleY
+    private var currentDimensionID = "minecraft:overworld"
     private var awaitingFirstTileForSeed = false
     private let tileGenerator: TileGenerationService
     private var inFlightStructureTask: Task<Void, Never>?
@@ -137,6 +139,7 @@ final class BrowserApp: DapperMapPlatform {
         self.document = JSObject.global.document.object!
         self.viewport = document.getElementById!("map-viewport").object!
         self.seedInput = document.getElementById!("seed-input").object!
+        self.dimensionInput = document.getElementById!("dimension-input").object!
         self.yInput = document.getElementById!("y-input").object!
         self.renderButton = document.getElementById!("render-button").object!
         self.statusElement = document.getElementById!("status").object!
@@ -220,7 +223,8 @@ final class BrowserApp: DapperMapPlatform {
         guard
             job.generation == activeViewGeneration,
             let seed = currentSeed,
-            seed == job.seed
+            seed == job.seed,
+            currentDimensionID == job.dimensionID
         else {
             scheduleNextTileBatch()
             return
@@ -305,6 +309,13 @@ final class BrowserApp: DapperMapPlatform {
         retainedClosures.append(keyClosure)
         _ = seedInput.addEventListener!("keydown", keyClosure)
         _ = yInput.addEventListener!("keydown", keyClosure)
+
+        let dimensionChangeClosure = JSClosure { [weak self] _ in
+            self?.prepareRender()
+            return .undefined
+        }
+        retainedClosures.append(dimensionChangeClosure)
+        _ = dimensionInput.addEventListener!("change", dimensionChangeClosure)
 
         let biomeResetClosure = JSClosure { [weak self] _ in
             self?.resetBiomeColorsToDefaults()
@@ -490,6 +501,7 @@ final class BrowserApp: DapperMapPlatform {
             do {
                 try await self.tileGenerator.initialize(bundleText: bundleText)
                 let metadata = await self.tileGenerator.browserRegistryMetadata()
+                self.reloadDimensionPicker(using: metadata.dimensionIDs)
                 self.reloadBiomeEditor(using: metadata.biomeIDs)
                 self.reloadStructureEditor(using: metadata.structureSets)
                 self.generatorReady = true
@@ -513,10 +525,12 @@ final class BrowserApp: DapperMapPlatform {
         }
 
         let sampleY = selectedSampleY()
-        if currentSeed != seed || currentSampleY != sampleY {
+        let dimensionID = dimensionInput.value.string ?? "minecraft:overworld"
+        if currentSeed != seed || currentSampleY != sampleY || currentDimensionID != dimensionID {
             setStatus("Compiling density functions…")
             currentSeed = seed
             currentSampleY = sampleY
+            currentDimensionID = dimensionID
             awaitingFirstTileForSeed = true
             tileCache.removeAll(keepingCapacity: true)
             pendingTileStructureJobs.removeAll(keepingCapacity: true)
@@ -654,6 +668,7 @@ final class BrowserApp: DapperMapPlatform {
                             tileX: tileX,
                             tileZ: tileZ,
                             sampleY: currentSampleY,
+                            dimensionID: currentDimensionID,
                             enabledStructureSets: Set(loadedStructureIDs.filter {
                                 shouldRenderStructureSet($0, in: viewState)
                             })
@@ -690,7 +705,8 @@ final class BrowserApp: DapperMapPlatform {
         guard !pendingTileJobs.isEmpty else { return }
         guard inFlightTileJob == nil else { return }
         let workerJob = pendingTileJobs.removeFirst()
-        guard workerJob.generation == activeViewGeneration, workerJob.seed == currentSeed else {
+        guard workerJob.generation == activeViewGeneration, workerJob.seed == currentSeed,
+              workerJob.dimensionID == currentDimensionID else {
             scheduleNextTileBatch()
             return
         }
@@ -712,7 +728,7 @@ final class BrowserApp: DapperMapPlatform {
         guard inFlightTileJob == nil, pendingTileJobs.isEmpty else { return }
         guard inFlightTileStructureJob == nil else { return }
         guard let seed = currentSeed else { return }
-        pendingTileStructureJobs.removeAll { $0.tileJob.seed != seed }
+        pendingTileStructureJobs.removeAll { $0.tileJob.seed != seed || $0.tileJob.dimensionID != currentDimensionID }
         guard !pendingTileStructureJobs.isEmpty else {
             setStructureGenerationStatus(
                 enabledStructureSetIDs().isEmpty ? "Structures: disabled." : "Structures: ready."
@@ -767,7 +783,7 @@ final class BrowserApp: DapperMapPlatform {
                 structureMetrics: result?.metrics ?? StructureProfilingMetrics()
             )
         }
-        if job.seed == currentSeed, let viewState = latestViewState {
+        if job.seed == currentSeed, job.dimensionID == currentDimensionID, let viewState = latestViewState {
             refreshVisibleStructures(for: viewState)
             drawGridOverlay(for: viewState)
         }
@@ -788,7 +804,8 @@ final class BrowserApp: DapperMapPlatform {
     ) {
         inFlightTileStructureJob = nil
         inFlightTileStructureTask = nil
-        if error is CancellationError, structureJob.tileJob.seed == currentSeed {
+        if error is CancellationError, structureJob.tileJob.seed == currentSeed,
+           structureJob.tileJob.dimensionID == currentDimensionID {
             pendingTileStructureJobs.append(structureJob)
         } else if structureJob.tileJob.generation == activeViewGeneration {
             setStructureSummary("Failed to locate structures: \(error)", isError: true)
@@ -1420,6 +1437,24 @@ final class BrowserApp: DapperMapPlatform {
         renderBiomeEditor()
     }
 
+    private func reloadDimensionPicker(using dimensionIDs: [String]) {
+        let selectedID = dimensionInput.value.string ?? "minecraft:overworld"
+        let availableIDs = dimensionIDs.isEmpty ? ["minecraft:overworld"] : dimensionIDs
+        dimensionInput.innerHTML = "".jsValue
+
+        for dimensionID in availableIDs {
+            let option = document.createElement!("option").object!
+            option.value = dimensionID.jsValue
+            option.innerText = dimensionID.jsValue
+            _ = dimensionInput.appendChild!(option)
+        }
+
+        let restoredID = availableIDs.contains(selectedID) ? selectedID : availableIDs.first
+        if let restoredID {
+            dimensionInput.value = restoredID.jsValue
+        }
+    }
+
     private func renderBiomeEditor() {
         biomeRowElements.removeAll(keepingCapacity: true)
         biomeListElement.innerHTML = "".jsValue
@@ -1684,6 +1719,7 @@ final class BrowserApp: DapperMapPlatform {
         let worldEndZ = worldStartZ + Double(viewState.viewportHeight) * viewState.blocksPerPixel
         let query = StructureQuery(
             seed: seed,
+            dimensionID: currentDimensionID,
             minX: clampedWorldCoordinate(floor(worldStartX)),
             maxX: clampedWorldCoordinate(ceil(worldEndX)),
             minZ: clampedWorldCoordinate(floor(worldStartZ)),
@@ -1727,6 +1763,7 @@ final class BrowserApp: DapperMapPlatform {
         let worldEndZ = worldStartZ + Double(viewState.viewportHeight) * viewState.blocksPerPixel
         let query = StructureQuery(
             seed: seed,
+            dimensionID: currentDimensionID,
             minX: clampedWorldCoordinate(floor(worldStartX)),
             maxX: clampedWorldCoordinate(ceil(worldEndX)),
             minZ: clampedWorldCoordinate(floor(worldStartZ)),
@@ -1829,6 +1866,7 @@ final class BrowserApp: DapperMapPlatform {
         let maxTileZ = Int(floor((worldEndZ - 0.0001) / tileWorldSpan))
         let query = StructureQuery(
             seed: seed,
+            dimensionID: currentDimensionID,
             minX: clampedWorldCoordinate(floor(worldStartX)),
             maxX: clampedWorldCoordinate(ceil(worldEndX)),
             minZ: clampedWorldCoordinate(floor(worldStartZ)),

@@ -90,6 +90,7 @@ struct DatapackBundleFile: Decodable {
 /// complete copy in the UI WebAssembly instance.
 struct BrowserRegistryMetadata: Sendable {
     let biomeIDs: [String]
+    let dimensionIDs: [String]
     let structureSets: [BrowserStructureSetMetadata]
 }
 
@@ -127,6 +128,7 @@ struct TileCacheKey: Hashable, Sendable {
 
 /// A fused sampler has a fixed volume, so cache one for each tile shape and stride.
 struct TileSamplerKey: Hashable, Sendable {
+    let dimensionID: String
     let sampleWidth: Int32
     let sampleHeight: Int32
     let sampleYCount: Int32
@@ -230,6 +232,7 @@ struct PendingTileJob: Sendable {
     let tileX: Int
     let tileZ: Int
     let sampleY: Int32
+    let dimensionID: String
     let enabledStructureSets: Set<String>?
 }
 
@@ -284,6 +287,7 @@ struct LootContainerPoint: Hashable, Sendable {
 
 struct StructureQuery: Sendable {
     let seed: WorldSeed
+    let dimensionID: String
     let minX: Int32
     let maxX: Int32
     let minZ: Int32

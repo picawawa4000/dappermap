@@ -7,7 +7,7 @@ final class DapperMapBaseTests: XCTestCase {
         let threads = SidebarField(id: "threads", label: "Threads", value: "4", kind: .integer(defaultValue: 4, range: 1...16))
         let sidebar = DapperMapBase.sidebar(extraDebugFields: [threads])
         XCTAssertEqual(sidebar.tabs.map(\.id), ["map", "biomes", "structures", "loot", "debug"])
-        XCTAssertEqual(sidebar.tabs.first?.fields.map(\.id), ["seed", "y", "status", "biome-status", "structure-status"])
+        XCTAssertEqual(sidebar.tabs.first?.fields.map(\.id), ["seed", "dimension", "y", "status", "biome-status", "structure-status"])
         XCTAssertEqual(sidebar.tabs.last?.fields, [threads])
     }
 

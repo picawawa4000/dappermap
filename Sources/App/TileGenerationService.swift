@@ -80,6 +80,13 @@ private final class ReusableBiomeTileSampler {
 /// Owns one non-thread-safe DPReader generation context. Platforms choose how instances are
 /// scheduled: the browser pins one to a Web Worker; native keeps one actor per requested thread.
 actor TileGenerationService: DapperMapGenerationPlatform {
+    // Vanilla declares its playable dimensions in the normal world preset rather than as
+    // `data/*/dimension` entries, so they do not appear in `dimensionsRegistry`.
+    private static let vanillaDimensionIDs: Set<String> = [
+        "minecraft:overworld",
+        "minecraft:the_nether",
+        "minecraft:the_end"
+    ]
 #if os(WASI)
     // A custom actor executor must be available without actor isolation. Leaving this stored
     // property isolated can cause a synchronous actor entry (such as `loot`) to trip Swift's
@@ -87,10 +94,10 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private nonisolated let serialExecutor: TileGenerationExecutor
     private let samplingBackend: TileSamplingBackend
     private let overworldDimension = RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld")
-    private let overworldNoiseSettings = RegistryKey<NoiseSettings>(referencing: "minecraft:overworld")
     private let tileSize = 256
     private var dataPack: DataPack?
     private var currentSeed: WorldSeed?
+    private var currentDimensionID: String?
     private var generator: WorldGenerator?
     private var usesNativeBulkSampler = false
     private var densityCompilationMilliseconds: Double?
@@ -118,10 +125,10 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private let samplingBackend: TileSamplingBackend
     private let prefersNativeCompilation: Bool
     private let overworldDimension = RegistryKey<DPReader.Dimension>(referencing: "minecraft:overworld")
-    private let overworldNoiseSettings = RegistryKey<NoiseSettings>(referencing: "minecraft:overworld")
     private let tileSize = 256
     private var dataPack: DataPack?
     private var currentSeed: WorldSeed?
+    private var currentDimensionID: String?
     private var generator: WorldGenerator?
     private var usesNativeBulkSampler = false
     private var densityCompilationMilliseconds: Double?
@@ -163,9 +170,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         dataPackRoot = rootURL
         dataPack = try DataPack(
             fromRootPath: rootURL,
-            loadingOptions: [
-                .noDimensions
-            ],
+            loadingOptions: [],
             decodingVersion: .assumedCurrent
         )
         structureSetDescriptors = try dataPack!.structureSetRegistry.entries().compactMap { entry in
@@ -186,7 +191,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         dataPackRoot = rootURL
         dataPack = try DataPack(
             fromRootPath: rootURL,
-            loadingOptions: [.noDimensions],
+            loadingOptions: [],
             decodingVersion: .assumedCurrent
         )
         structureSetDescriptors = try dataPack!.structureSetRegistry.entries().compactMap { entry in
@@ -208,7 +213,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     /// program because its buffer stride and shape are part of the compilation key.
     private func prewarmCompiledDensityFunctions() throws {
         guard let dataPack else { return }
-        try configureGenerator(for: 0, using: dataPack)
+        try configureGenerator(for: 0, dimensionID: "minecraft:overworld", using: dataPack)
         guard let generator, usesNativeBulkSampler || samplingBackend == .nestedWASM else { return }
         let strategy: CompilationBackend = samplingBackend == .nestedWASM ? .wasm : .llvm
         for exponent in -3...8 {
@@ -217,6 +222,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             let sampleScale = max(1, Int32((Double(tileSpan) / 128.0).rounded()))
             let sampleWidth = max(1, Int((tileSpan + sampleScale - 1) / sampleScale))
             let key = TileSamplerKey(
+                dimensionID: "minecraft:overworld",
                 sampleWidth: Int32(sampleWidth), sampleHeight: Int32(sampleWidth), sampleYCount: 1,
                 sampleScale: sampleScale, sampleYStep: 1
             )
@@ -235,6 +241,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         // height. Precompile that tiny shape so the first structure does not invoke the compiler.
         _ = try compiledBiomeSampler(
             using: generator,
+            dimensionID: "minecraft:overworld",
             sampleWidth: 1,
             sampleHeight: 1,
             sampleYCount: 1,
@@ -248,10 +255,11 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         try generator.generateInto(warmupChunk, at: PosInt2D(x: 0, z: 0))
     }
 
-    func registryIDs() -> (biomes: [String], structures: [String]) {
-        guard let dataPack else { return ([], []) }
+    func registryIDs() -> (biomes: [String], dimensions: [String], structures: [String]) {
+        guard let dataPack else { return ([], [], []) }
         return (
             dataPack.biomeRegistry.entries().map(\.key.name).sorted(),
+            loadedDimensionIDs(in: dataPack),
             dataPack.structureSetRegistry.entries().map(\.key.name).sorted()
         )
     }
@@ -259,6 +267,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     func browserRegistryMetadata() -> BrowserRegistryMetadata {
         BrowserRegistryMetadata(
             biomeIDs: dataPack?.biomeRegistry.entries().map(\.key.name).sorted() ?? [],
+            dimensionIDs: dataPack.map(loadedDimensionIDs(in:)) ?? [],
             structureSets: structureSetDescriptors
                 .map {
                     BrowserStructureSetMetadata(
@@ -272,6 +281,12 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         )
     }
 
+    private func loadedDimensionIDs(in dataPack: DataPack) -> [String] {
+        Self.vanillaDimensionIDs
+            .union(dataPack.dimensionsRegistry.entries().map(\.key.name))
+            .sorted()
+    }
+
     /// Generate the paintable part of a tile. Browser callers use this entry point so structure
     /// discovery cannot delay the first pixels; native callers continue through `generate`.
     func generateBiomeTile(_ job: PendingTileJob) throws -> GeneratedTile {
@@ -280,7 +295,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         }
 
         let start = Date()
-        try configureGenerator(for: job.seed, using: dataPack)
+        try configureGenerator(for: job.seed, dimensionID: job.dimensionID, using: dataPack)
         try Task.checkCancellation()
 
         let generated = try makeTile(
@@ -288,7 +303,8 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             blocksPerPixel: job.tileBlocksPerPixel,
             tileX: job.tileX,
             tileZ: job.tileZ,
-            sampleY: job.sampleY
+            sampleY: job.sampleY,
+            dimensionID: job.dimensionID
         )
         try Task.checkCancellation()
         return GeneratedTile(
@@ -329,6 +345,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         try Task.checkCancellation()
         let structureQuery = StructureQuery(
             seed: job.seed,
+            dimensionID: job.dimensionID,
             minX: biomeCache.usableMinX,
             maxX: biomeCache.usableMaxX,
             minZ: biomeCache.usableMinZ,
@@ -358,6 +375,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             tileX: request.tileX,
             tileZ: request.tileZ,
             sampleY: request.sampleY,
+            dimensionID: request.dimensionID,
             enabledStructureSets: request.enabledStructureSets
         ))
         return MapTilePresentation(
@@ -418,10 +436,11 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         guard let dataPack else {
             throw BrowserAppError.message("Tile generation worker is not ready.")
         }
-        try configureGenerator(for: query.seed, using: dataPack)
+        try configureGenerator(for: query.seed, dimensionID: query.dimensionID, using: dataPack)
         guard let generator, let structureSampler else { return nil }
         let validationContext = try makeValidationContext(
             using: generator,
+            dimensionID: query.dimensionID,
             biomeSampler: biomeSampler
         )
 
@@ -584,10 +603,11 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         guard let dataPack else {
             throw BrowserAppError.message("Tile generation worker is not ready.")
         }
-        try configureGenerator(for: query.seed, using: dataPack)
+        try configureGenerator(for: query.seed, dimensionID: query.dimensionID, using: dataPack)
         guard let generator, let structureSampler else { return nil }
         let validationContext = try makeValidationContext(
             using: generator,
+            dimensionID: query.dimensionID,
             biomeSampler: biomeSampler
         )
 
@@ -668,51 +688,18 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         guard let definition = dataPack.structureRegistry.get(RegistryKey(referencing: structure.structureID)) else {
             return []
         }
-        let encodedDefinition = try JSONDecoder().decode(
-            EncodedStructureDefinition.self,
-            from: JSONEncoder().encode(definition)
-        )
         let startChunk = PosInt2D(x: floorDivide(structure.x, by: 16), z: floorDivide(structure.z, by: 16))
         var terrainChunks: [String: ProtoChunk] = [:]
-        var terrainChunkCoordinates = Set<String>()
-        switch encodedDefinition.type {
-        case "minecraft:desert_pyramid":
-            // Desert pyramids determine their final Y position from the terrain beneath their
-            // 21×21 footprint. The default context is all air, which rejects every pyramid.
-            for chunkZ in startChunk.z...(startChunk.z + 1) {
-                for chunkX in startChunk.x...(startChunk.x + 1) {
-                    terrainChunkCoordinates.insert("\(chunkX),\(chunkZ)")
-                }
-            }
-        default:
-            break
-        }
-
-        let needsGeneratedTerrain = encodedDefinition.type == "minecraft:jigsaw"
-            || encodedDefinition.type == "minecraft:buried_treasure"
-            || !terrainChunkCoordinates.isEmpty
-        let terrainGenerator: WorldGenerator?
-        if needsGeneratedTerrain {
-            try configureGenerator(for: seed, using: dataPack)
-            guard let generator else {
-                throw BrowserAppError.message("Structure generation worker is not ready.")
-            }
-            terrainGenerator = generator
-        } else {
-            terrainGenerator = nil
-        }
-        if !terrainChunkCoordinates.isEmpty, let terrainGenerator {
-            for coordinate in terrainChunkCoordinates {
-                let values = coordinate.split(separator: ",", maxSplits: 1).compactMap { Int32($0) }
-                guard values.count == 2 else { continue }
-                let chunk = ProtoChunk()
-                try terrainGenerator.generateInto(chunk, at: PosInt2D(x: values[0], z: values[1]))
-                terrainChunks[coordinate] = chunk
-            }
+        // Every structure receives the same lazy terrain provider. Most structures never ask
+        // for a block, so they do not cause any terrain chunks to be generated. Those that do
+        // (for example pyramids, jigsaw pieces, and mineshaft minecarts) populate this cache on
+        // demand, one chunk at a time.
+        try configureGenerator(for: seed, dimensionID: "minecraft:overworld", using: dataPack)
+        guard let terrainGenerator = generator else {
+            throw BrowserAppError.message("Structure generation worker is not ready.")
         }
 
         let air = BlockState(id: "minecraft:air")
-        let terrain = BlockState(id: "minecraft:stone")
         let context = StructureGenerationContext(
             seaLevel: 63,
             minimumWorldY: -64,
@@ -721,7 +708,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 let chunkX = floorDivide(position.x, by: 16)
                 let chunkZ = floorDivide(position.z, by: 16)
                 let coordinate = "\(chunkX),\(chunkZ)"
-                if terrainChunks[coordinate] == nil, let terrainGenerator {
+                if terrainChunks[coordinate] == nil {
                     let chunk = ProtoChunk()
                     try? terrainGenerator.generateInto(chunk, at: PosInt2D(x: chunkX, z: chunkZ))
                     terrainChunks[coordinate] = chunk
@@ -739,35 +726,10 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 return chunk.block(atLocal: localPosition)
             }
         )
-        // The map intentionally shows biome-valid placement candidates. Mansion layouts need a
-        // terrain height only for their vertical anchor, but our coarse density preview can
-        // disagree with vanilla's final surface at a corner. Use the vanilla flat-reference
-        // anchor so candidate loot remains deterministic and matches DPReader's layout.
-        let lootContext: StructureGenerationContext
-        if encodedDefinition.type == "minecraft:woodland_mansion" {
-            let mansionTerrain = BlockState(id: "minecraft:stone")
-            lootContext = StructureGenerationContext(
-                seaLevel: 63,
-                minimumWorldY: -64,
-                usingDataPacks: [dataPack],
-                blockSampler: { position in position.y <= 70 ? mansionTerrain : air }
-            )
-        } else if encodedDefinition.type == "minecraft:stronghold" {
-            // Stronghold post-processing consumes its decoration RNG only while replacing
-            // terrain. Match DPReader's validated flat-stone generation context.
-            lootContext = StructureGenerationContext(
-                seaLevel: 63,
-                minimumWorldY: -64,
-                usingDataPacks: [dataPack],
-                blockSampler: { position in position.y <= 63 ? terrain : air }
-            )
-        } else {
-            lootContext = context
-        }
         let generatedContainers = try definition.generateLoot(
             worldSeed: seed,
             startChunk: startChunk,
-            context: lootContext
+            context: context
         )
         guard let containers = generatedContainers else {
             return []
@@ -888,7 +850,25 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         return formattedItems
     }
 
-    private func configureGenerator(for seed: WorldSeed, using dataPack: DataPack) throws {
+    private func configureGenerator(for seed: WorldSeed, dimensionID: String, using dataPack: DataPack) throws {
+        if currentDimensionID != dimensionID {
+            generator = nil
+            currentSeed = nil
+            currentDimensionID = dimensionID
+            samplers.removeAll(keepingCapacity: true)
+            structureSampler = nil
+            validatedStructureStarts.removeAll(keepingCapacity: true)
+            rejectedStructureStarts.removeAll(keepingCapacity: true)
+            randomStructurePlacements.removeAll(keepingCapacity: true)
+            emptyRandomStructureRegions.removeAll(keepingCapacity: true)
+            concentricStructurePlacements.removeAll(keepingCapacity: true)
+            structureHeightmapSampler = nil
+#if os(WASI)
+            wasmRuntime?.invalidate()
+            wasmRuntime = nil
+#endif
+        }
+        let noiseSettings = RegistryKey<NoiseSettings>(referencing: noiseSettingsID(for: dimensionID))
         if let generator {
             if currentSeed != seed {
                 // DPReader retains compiled graphs and search trees across seed changes.
@@ -921,7 +901,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                     generator = try WorldGenerator(
                         withWorldSeed: seed,
                         usingDataPacks: [dataPack],
-                        usingSettings: overworldNoiseSettings,
+                        usingSettings: noiseSettings,
                         compilationBackend: .wasm,
                         wasmRuntime: runtime
                     )
@@ -942,7 +922,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                         generator = try WorldGenerator(
                             withWorldSeed: seed,
                             usingDataPacks: [dataPack],
-                            usingSettings: overworldNoiseSettings,
+                            usingSettings: noiseSettings,
                             compilationBackend: .llvm
                         )
                         usesNativeBulkSampler = true
@@ -951,7 +931,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                         generator = try WorldGenerator(
                             withWorldSeed: seed,
                             usingDataPacks: [dataPack],
-                            usingSettings: overworldNoiseSettings
+                            usingSettings: noiseSettings
                         )
                         usesNativeBulkSampler = false
                     }
@@ -959,7 +939,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                     generator = try WorldGenerator(
                         withWorldSeed: seed,
                         usingDataPacks: [dataPack],
-                        usingSettings: overworldNoiseSettings
+                        usingSettings: noiseSettings
                     )
                     usesNativeBulkSampler = false
                 }
@@ -967,7 +947,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 generator = try WorldGenerator(
                     withWorldSeed: seed,
                     usingDataPacks: [dataPack],
-                    usingSettings: overworldNoiseSettings
+                    usingSettings: noiseSettings
                 )
                 usesNativeBulkSampler = false
 #endif
@@ -991,6 +971,24 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         }
     }
 
+    private func dimensionKey(for dimensionID: String) -> RegistryKey<DPReader.Dimension> {
+        // DPReader names the vanilla Nether biome tree `minecraft:nether`, while the vanilla
+        // world preset (and therefore the UI) identifies the dimension as `minecraft:the_nether`.
+        let generatorID = dimensionID == "minecraft:the_nether" ? "minecraft:nether" : dimensionID
+        return RegistryKey(referencing: generatorID)
+    }
+
+    private func noiseSettingsID(for dimensionID: String) -> String {
+        switch dimensionID {
+        case "minecraft:the_nether", "minecraft:nether":
+            return "minecraft:nether"
+        case "minecraft:the_end", "minecraft:end":
+            return "minecraft:end"
+        default:
+            return "minecraft:overworld"
+        }
+    }
+
     private func pointIsVisible(_ point: PosInt2D, in query: StructureQuery) -> Bool {
         point.x >= query.minX && point.x <= query.maxX
             && point.z >= query.minZ && point.z <= query.maxZ
@@ -998,8 +996,10 @@ actor TileGenerationService: DapperMapGenerationPlatform {
 
     private func makeValidationContext(
         using generator: WorldGenerator,
+        dimensionID: String,
         biomeSampler: @escaping (PosInt3D) throws -> RegistryKey<Biome>?
     ) throws -> StructureStartValidationContext {
+        let dimension = dimensionKey(for: dimensionID)
         let terrain: GeneratedStructureHeightmapSampler
         if let existing = structureHeightmapSampler {
             terrain = existing
@@ -1009,12 +1009,12 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 seaLevel: 63,
                 minimumWorldY: -64,
                 maximumWorldY: 319,
-                dimension: overworldDimension
+                dimension: dimension
             )
             structureHeightmapSampler = terrain
         }
         return StructureStartValidationContext(
-            dimension: overworldDimension,
+            dimension: dimension,
             seaLevel: 63,
             minimumWorldY: -64,
             maximumWorldY: 319,
@@ -1025,6 +1025,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
 
     private func compiledBiomeSampler(
         using generator: WorldGenerator,
+        dimensionID: String,
         sampleWidth: Int32,
         sampleHeight: Int32,
         sampleYCount: Int32 = 1,
@@ -1035,6 +1036,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         // The key includes both fixed shape and stride, matching DPReader's retained-sampler
         // contract. The associated output buffer is reused for every subsequent tile.
         let key = TileSamplerKey(
+            dimensionID: dimensionID,
             sampleWidth: sampleWidth,
             sampleHeight: sampleHeight,
             sampleYCount: sampleYCount,
@@ -1050,7 +1052,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                     xCount: sampleWidth, yCount: sampleYCount, zCount: sampleHeight,
                     xStep: sampleScale, yStep: sampleYStep, zStep: sampleScale
                 ),
-                in: overworldDimension,
+                in: dimensionKey(for: dimensionID),
                 strategy: strategy
             )
             sampler = ReusableBiomeTileSampler(sampler: compiled)
@@ -1061,6 +1063,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
 
     private func compiledBiomeNames(
         using generator: WorldGenerator,
+        dimensionID: String,
         sampleWidth: Int32,
         sampleHeight: Int32,
         sampleYCount: Int32 = 1,
@@ -1071,6 +1074,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     ) throws -> [String] {
         try compiledBiomeSampler(
             using: generator,
+            dimensionID: dimensionID,
             sampleWidth: sampleWidth,
             sampleHeight: sampleHeight,
             sampleYCount: sampleYCount,
@@ -1085,7 +1089,8 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         blocksPerPixel: Double,
         tileX: Int,
         tileZ: Int,
-        sampleY: Int32
+        sampleY: Int32,
+        dimensionID: String
     ) throws -> (tile: CachedTile, biomeCache: TileBiomeCache) {
         // Keep the normal map path at a fixed 128-by-128 output shape. The level of detail lives
         // in the sampling stride, which lets one fused bulk program serve every tile at a scale.
@@ -1101,6 +1106,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         case .nestedWASM:
             (palette, indices) = try compiledBiomeSampler(
                 using: generator,
+                dimensionID: dimensionID,
                 sampleWidth: Int32(sampleWidth),
                 sampleHeight: Int32(sampleWidth),
                 sampleScale: sampleScale,
@@ -1110,6 +1116,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             if usesNativeBulkSampler {
                 (palette, indices) = try compiledBiomeSampler(
                     using: generator,
+                    dimensionID: dimensionID,
                     sampleWidth: Int32(sampleWidth),
                     sampleHeight: Int32(sampleWidth),
                     sampleScale: sampleScale,
@@ -1121,7 +1128,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                     from: PosInt2D(x: startX, z: startZ),
                     to: PosInt2D(x: startX + extent, z: startZ + extent),
                     atY: sampleY,
-                    in: overworldDimension,
+                    in: dimensionKey(for: dimensionID),
                     scale: sampleScale,
                     forceNoBaking: sampleScale == 1
                 ) else {
@@ -1176,18 +1183,18 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         ) { [self] position in
             switch samplingBackend {
             case .nestedWASM:
-                guard let biome = try compiledBiomeNames(using: generator, sampleWidth: 1, sampleHeight: 1, sampleYCount: 1, sampleScale: structureScale, sampleYStep: 4, at: position, strategy: .wasm).first else {
-                    throw BrowserAppError.message("The overworld structure biome sampler returned no data.")
+                guard let biome = try compiledBiomeNames(using: generator, dimensionID: dimensionID, sampleWidth: 1, sampleHeight: 1, sampleYCount: 1, sampleScale: structureScale, sampleYStep: 4, at: position, strategy: .wasm).first else {
+                    throw BrowserAppError.message("The dimension structure biome sampler returned no data.")
                 }
                 return biome
             case .scalar where usesNativeBulkSampler:
-                guard let biome = try compiledBiomeNames(using: generator, sampleWidth: 1, sampleHeight: 1, sampleYCount: 1, sampleScale: structureScale, sampleYStep: 4, at: position, strategy: .llvm).first else {
-                    throw BrowserAppError.message("The overworld structure biome sampler returned no data.")
+                guard let biome = try compiledBiomeNames(using: generator, dimensionID: dimensionID, sampleWidth: 1, sampleHeight: 1, sampleScale: structureScale, sampleYStep: 4, at: position, strategy: .llvm).first else {
+                    throw BrowserAppError.message("The dimension structure biome sampler returned no data.")
                 }
                 return biome
             case .scalar:
-                guard let biome = try generator.sampleBiome(at: position, in: overworldDimension) else {
-                    throw BrowserAppError.message("The overworld structure biome sampler returned no data.")
+                guard let biome = try generator.sampleBiome(at: position, in: dimensionKey(for: dimensionID)) else {
+                    throw BrowserAppError.message("The dimension structure biome sampler returned no data.")
                 }
                 return biome.name
             }

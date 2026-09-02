@@ -78,8 +78,8 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
         }
     }
 
-    public func registryIDs() async -> (biomes: [String], structures: [String]) {
-        guard let worker = workers.first else { return ([], []) }
+    public func registryIDs() async -> (biomes: [String], dimensions: [String], structures: [String]) {
+        guard let worker = workers.first else { return ([], [], []) }
         return await worker.registryIDs()
     }
 
@@ -100,6 +100,7 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
                 tileX: request.tileX,
                 tileZ: request.tileZ,
                 sampleY: request.sampleY,
+                dimensionID: request.dimensionID,
                 enabledStructureSets: request.enabledStructureSets
             )
             let result = try await workers[workerIndex].generate(job)

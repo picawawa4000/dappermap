@@ -26,6 +26,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
     private var panels: [String: NSView] = [:]
     private var orderedTabIDs: [String] = []
     private var seedInput: NSTextField?
+    private var dimensionInput: NSPopUpButton?
     private var yInput: NSTextField?
     private var statusLabel: NSTextField?
     private var biomeGenerationStatusLabel: NSTextField?
@@ -52,6 +53,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
     private var renderTimer: Timer?
     private var currentSeed: Int64?
     private var currentSampleY: Int32 = 256
+    private var currentDimensionID = "minecraft:overworld"
     private var completedTiles = 0
     private var pendingTiles = 0
     private var awaitingFirstTileForSeed = false
@@ -247,6 +249,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         switch tab.id {
         case "map":
             let seedField = tab.fields.first { $0.id == "seed" }
+            let dimensionField = tab.fields.first { $0.id == "dimension" }
             let yFieldPresentation = tab.fields.first { $0.id == "y" }
             let seedLabel = label(seedField?.label ?? "Seed", size: 15, bold: true)
             stack.addArrangedSubview(seedLabel)
@@ -257,6 +260,14 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             input.action = #selector(renderSeed)
             stack.addArrangedSubview(input)
             seedInput = input
+            stack.addArrangedSubview(label(dimensionField?.label ?? "Dimension", size: 15, bold: true))
+            let dimensionPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+            dimensionPicker.addItem(withTitle: dimensionField?.value ?? "minecraft:overworld")
+            dimensionPicker.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            dimensionPicker.target = self
+            dimensionPicker.action = #selector(renderSeed)
+            stack.addArrangedSubview(dimensionPicker)
+            dimensionInput = dimensionPicker
             stack.addArrangedSubview(label(yFieldPresentation?.label ?? "Y", size: 15, bold: true))
             stack.addArrangedSubview(label("Multiples of 4", size: 11, bold: false))
             let yField = NSTextField(string: yFieldPresentation?.value ?? "256")
@@ -393,6 +404,14 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         }
         biomeList?.setFrameSize(NSSize(width: 324, height: max(470, ids.count * 27)))
         mapView.biomeColors = biomeColors
+    }
+
+    private func populateDimensionPicker(_ ids: [String]) {
+        let selectedID = dimensionInput?.titleOfSelectedItem ?? "minecraft:overworld"
+        let availableIDs = ids.isEmpty ? ["minecraft:overworld"] : ids
+        dimensionInput?.removeAllItems()
+        dimensionInput?.addItems(withTitles: availableIDs)
+        dimensionInput?.selectItem(withTitle: availableIDs.contains(selectedID) ? selectedID : availableIDs[0])
     }
 
     private func populateStructureList(_ ids: [String]) {
@@ -591,11 +610,13 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         }
         let rawY = Int32(yInput?.integerValue ?? 256)
         let sampleY = Int32((Double(min(316, max(-64, rawY)) / 4).rounded())) * 4
+        let dimensionID = dimensionInput?.titleOfSelectedItem ?? "minecraft:overworld"
         yInput?.integerValue = Int(sampleY)
-        if currentSeed != seed || currentSampleY != sampleY {
+        if currentSeed != seed || currentSampleY != sampleY || currentDimensionID != dimensionID {
             commonBase.render(status: "Preparing generator state…")
             currentSeed = seed
             currentSampleY = sampleY
+            currentDimensionID = dimensionID
             awaitingFirstTileForSeed = true
             mapView.currentSeed = seed
             mapView.tiles.removeAll(keepingCapacity: true)
@@ -638,6 +659,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
                 guard self.threadCount == threadCount else { return }
                 self.scheduler = next
                 self.populateBiomeList(registry.biomes)
+                self.populateDimensionPicker(registry.dimensions)
                 self.populateStructureList(registry.structures)
                 self.commonBase.render(status: "Datapack ready. Enter a seed and click Render.")
                 self.biomeGenerationStatusLabel?.stringValue = "Biomes: ready to render."
@@ -702,6 +724,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
                     tileX: tileX,
                     tileZ: tileZ,
                     sampleY: Int32((Double(min(316, max(-64, yInput?.integerValue ?? 256)) / 4).rounded())) * 4,
+                    dimensionID: currentDimensionID,
                     enabledStructureSets: enabledStructureSets
                 ))
         }
