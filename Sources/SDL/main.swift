@@ -1,5 +1,6 @@
 import DapperMapCore
 import DapperMapEngine
+import DPReader
 import Foundation
 import SDL2
 
@@ -39,7 +40,7 @@ private final class SDLMapApplication {
     private var needsTextureRebuild = false
     private var tooltip = ""
     private var loot: [MapLootPresentation] = []
-    private var status = "Ready. Press R to render seed 0."
+    private var status = "Ready: Minecraft 1.21.11. Press R to render seed 0."
     private var biomeGenerationStatus = "Biomes: waiting."
     private var structureGenerationStatus = "Structures: waiting."
     private var sidebar: SidebarPresentation = DapperMapBase.sidebar()
@@ -62,6 +63,8 @@ private final class SDLMapApplication {
     private var generationPlatform: NativeGenerationPlatform?
     private var generationPlatformThreadCount = 0
     private var generationPlatformRoot: URL?
+    private var generationPlatformPackFormat: Version?
+    private var selectedDatapack = defaultVanillaDatapack
 
     func run() {
         guard let window = SDL_CreateWindow(
@@ -102,8 +105,16 @@ private final class SDLMapApplication {
                     if hasRendered { resizeDeadline = SDL_GetTicks() &+ 150 }
                 case SDL_KEYDOWN.rawValue:
                     let key = event.key.keysym.sym
+                    let modifiers = event.key.keysym.mod
+                    let clipboardModifier = modifiers & UInt16(KMOD_CTRL.rawValue | KMOD_GUI.rawValue) != 0
+                    if clipboardModifier, key == SDLK_c.rawValue {
+                        _ = SDL_SetClipboardText(seedText)
+                        if !editingSeed { break }
+                    }
                     if editingSeed {
-                        if key == SDLK_RETURN.rawValue || key == SDLK_KP_ENTER.rawValue {
+                        if clipboardModifier, key == SDLK_v.rawValue {
+                            pasteSeedFromClipboard()
+                        } else if key == SDLK_RETURN.rawValue || key == SDLK_KP_ENTER.rawValue {
                             if let value = Int64(seedText) ?? UInt64(seedText).map({ Int64(bitPattern: $0) }) {
                                 seed = value
                                 editingSeed = false
@@ -123,6 +134,8 @@ private final class SDLMapApplication {
                     if key == SDLK_ESCAPE.rawValue || key == SDLK_q.rawValue { running = false }
                     if key == SDLK_LEFTBRACKET.rawValue { threadCount = max(1, threadCount - 1); requestRegenerate() }
                     if key == SDLK_RIGHTBRACKET.rawValue { threadCount = min(32, threadCount + 1); requestRegenerate() }
+                    if key == SDLK_z.rawValue { changeDatapackVersion(by: -1) }
+                    if key == SDLK_x.rawValue { changeDatapackVersion(by: 1) }
                     if key == SDLK_PAGEUP.rawValue { sampleY = min(316, sampleY + 4); requestRegenerate() }
                     if key == SDLK_PAGEDOWN.rawValue { sampleY = max(-64, sampleY - 4); requestRegenerate() }
                     if key == SDLK_r.rawValue { requestRegenerate() }
@@ -177,15 +190,27 @@ private final class SDLMapApplication {
         }
     }
 
+    private func pasteSeedFromClipboard() {
+        guard let pointer = SDL_GetClipboardText() else { return }
+        defer { SDL_free(pointer) }
+        let pasted = String(cString: pointer).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Int64(pasted) != nil || UInt64(pasted).map({ Int64(bitPattern: $0) }) != nil else {
+            status = "CLIPBOARD IS NOT A 64 BIT SEED"
+            return
+        }
+        seedText = pasted
+    }
+
     private func requestRegenerate() {
         hasRendered = true
         renderGeneration &+= 1
         let generation = renderGeneration
+        let datapack = selectedDatapack
         status = "Preparing world generator…"
         let root: URL
-        do { root = try datapackRoot() }
+        do { root = try datapackRoot(for: datapack) }
         catch {
-            status = "Datapack not found"
+            status = "Minecraft \(datapack.version) datapack not found"
             return
         }
         let tileBPP = MapMath.tileBlocksPerPixel(for: blocksPerPixel)
@@ -224,20 +249,22 @@ private final class SDLMapApplication {
         let platform: NativeGenerationPlatform
         if let cached = generationPlatform,
            generationPlatformThreadCount == workers,
-           generationPlatformRoot == root {
+           generationPlatformRoot == root,
+           generationPlatformPackFormat == datapack.packFormat {
             platform = cached
         } else {
             platform = NativeGenerationPlatform(threadCount: workers)
             generationPlatform = platform
             generationPlatformThreadCount = workers
             generationPlatformRoot = root
+            generationPlatformPackFormat = datapack.packFormat
         }
         let results = generationResults
         let startedAt = Date()
         Task.detached {
             do {
                 results.store(.progress(generation: generation, message: "Preparing world generator…", elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000))
-                try await platform.initialize(rootURL: root)
+                try await platform.initialize(rootURL: root, packFormat: datapack.packFormat)
                 let registry = await platform.registryIDs()
                 results.store(.registry(biomes: registry.biomes, structures: registry.structures))
                 results.store(.progress(generation: generation, message: "Generating centre tiles first…", elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000))
@@ -357,7 +384,7 @@ private final class SDLMapApplication {
         drawText(renderer, text: "DAPPERMAP SDL", x: mapWidth + 18, y: 22, scale: 3)
         drawSidebar(renderer)
         drawText(renderer, text: "DRAG MAP TO PAN", x: mapWidth + 18, y: mapHeight - 70, scale: 2)
-        drawText(renderer, text: "R RENDER [] THREADS", x: mapWidth + 18, y: mapHeight - 36, scale: 1)
+        drawText(renderer, text: "R RENDER [] THREADS Z/X VERSION CTRL V/C SEED", x: mapWidth + 18, y: mapHeight - 36, scale: 1)
         SDL_RenderPresent(renderer)
     }
 
@@ -383,15 +410,16 @@ private final class SDLMapApplication {
         }
         if tab.id == "map" {
             let cursor = editingSeed && (SDL_GetTicks() / 500).isMultiple(of: 2) ? "_" : ""
-            drawText(renderer, text: "SEED", x: mapWidth + 18, y: y, scale: 1)
-            drawText(renderer, text: "\(seedText)\(cursor)", x: mapWidth + 18, y: y + 16, scale: 2)
-            drawText(renderer, text: "Y", x: mapWidth + 18, y: y + 48, scale: 1)
-            drawText(renderer, text: "\(sampleY)  PGUP/PGDN", x: mapWidth + 18, y: y + 64, scale: 2)
-            drawText(renderer, text: "STATUS", x: mapWidth + 18, y: y + 100, scale: 1)
-            drawText(renderer, text: status, x: mapWidth + 18, y: y + 116, scale: 1)
-            drawText(renderer, text: biomeGenerationStatus, x: mapWidth + 18, y: y + 138, scale: 1)
-            drawText(renderer, text: structureGenerationStatus, x: mapWidth + 18, y: y + 160, scale: 1)
-            drawText(renderer, text: "X \(Int(centerX)) Z \(Int(centerZ)) BPP \(blocksPerPixel)", x: mapWidth + 18, y: y + 182, scale: 1)
+            drawText(renderer, text: "VERSION \(selectedDatapack.version) Z/X", x: mapWidth + 18, y: y, scale: 1)
+            drawText(renderer, text: "SEED", x: mapWidth + 18, y: y + 20, scale: 1)
+            drawText(renderer, text: "\(seedText)\(cursor)", x: mapWidth + 18, y: y + 36, scale: 2)
+            drawText(renderer, text: "Y", x: mapWidth + 18, y: y + 68, scale: 1)
+            drawText(renderer, text: "\(sampleY)  PGUP/PGDN", x: mapWidth + 18, y: y + 84, scale: 2)
+            drawText(renderer, text: "STATUS", x: mapWidth + 18, y: y + 120, scale: 1)
+            drawText(renderer, text: status, x: mapWidth + 18, y: y + 136, scale: 1)
+            drawText(renderer, text: biomeGenerationStatus, x: mapWidth + 18, y: y + 158, scale: 1)
+            drawText(renderer, text: structureGenerationStatus, x: mapWidth + 18, y: y + 180, scale: 1)
+            drawText(renderer, text: "X \(Int(centerX)) Z \(Int(centerZ)) BPP \(blocksPerPixel)", x: mapWidth + 18, y: y + 202, scale: 1)
         } else if tab.id == "debug" {
             let last = tile.map { "\($0.tileX), \($0.tileZ)" } ?? "WAITING"
             drawText(renderer, text: "LAST TILE \(last)", x: mapWidth + 18, y: y, scale: 1)
@@ -452,11 +480,39 @@ private final class SDLMapApplication {
         }
     }
 
-    private func datapackRoot() throws -> URL {
+    private func changeDatapackVersion(by offset: Int) {
+        guard let index = vanillaDatapacks.firstIndex(of: selectedDatapack) else { return }
+        let nextIndex = min(max(0, index + offset), vanillaDatapacks.count - 1)
+        guard nextIndex != index else { return }
+        selectedDatapack = vanillaDatapacks[nextIndex]
+        generationPlatform = nil
+        generationPlatformRoot = nil
+        generationPlatformPackFormat = nil
+        tiles.removeAll(keepingCapacity: true)
+        tile = nil
+        loot.removeAll(keepingCapacity: true)
+        loadedBiomeIDs.removeAll(keepingCapacity: true)
+        loadedStructureIDs.removeAll(keepingCapacity: true)
+        enabledStructureSets.removeAll(keepingCapacity: true)
+        selectedColorID = nil
+        needsTextureRebuild = true
+        status = "Loading Minecraft \(selectedDatapack.version)…"
+        requestRegenerate()
+    }
+
+    private func datapackRoot(for datapack: VanillaDatapack) throws -> URL {
         let fileManager = FileManager.default
-        let candidates = [ProcessInfo.processInfo.environment["DAPPERMAP_DATAPACK"], "Data/1.21.11"].compactMap { $0 }.map { URL(fileURLWithPath: $0) }
+        let override = ProcessInfo.processInfo.environment["DAPPERMAP_DATAPACK"]?
+            .replacingOccurrences(of: "{version}", with: datapack.version)
+        let candidates = [override, datapack.nativeDataDirectory]
+            .compactMap { $0 }
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
         for candidate in candidates where fileManager.fileExists(atPath: candidate.appendingPathComponent("data/minecraft/worldgen/biome").path) { return candidate }
-        throw NSError(domain: "DapperMap", code: 1)
+        throw NSError(
+            domain: "DapperMap",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Extract Minecraft \(datapack.version) to \(datapack.nativeDataDirectory), or set DAPPERMAP_DATAPACK."]
+        )
     }
 
 

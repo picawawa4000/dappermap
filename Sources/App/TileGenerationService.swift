@@ -166,12 +166,12 @@ actor TileGenerationService: DapperMapGenerationPlatform {
 
     func initialize(bundleText: String) throws {
         let bundle = try JSONDecoder().decode(DatapackBundle.self, from: Data(bundleText.utf8))
+        resetForDatapackReload()
         let rootURL = try materialize(bundle: bundle)
         dataPackRoot = rootURL
         dataPack = try DataPack(
             fromRootPath: rootURL,
-            loadingOptions: [],
-            decodingVersion: .assumedCurrent
+            loadingOptions: []
         )
         structureSetDescriptors = try dataPack!.structureSetRegistry.entries().compactMap { entry in
             let data = try JSONEncoder().encode(entry.value)
@@ -187,12 +187,13 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         try prewarmCompiledDensityFunctions()
     }
 
-    func initialize(rootURL: URL) throws {
+    func initialize(rootURL: URL, decodingVersion: Version? = nil) throws {
+        resetForDatapackReload()
         dataPackRoot = rootURL
         dataPack = try DataPack(
             fromRootPath: rootURL,
             loadingOptions: [],
-            decodingVersion: .assumedCurrent
+            decodingVersion: decodingVersion
         )
         structureSetDescriptors = try dataPack!.structureSetRegistry.entries().compactMap { entry in
             let data = try JSONEncoder().encode(entry.value)
@@ -419,6 +420,76 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 items: $0.loot
             )
         }
+    }
+
+    func searchLoot(_ query: LootSearchQuery, seed: Int64) async throws -> [MapLootPresentation] {
+        try await searchLoot(query, seed: seed, onProgress: { _ in })
+    }
+
+    func searchLoot(
+        _ query: LootSearchQuery,
+        seed: Int64,
+        onProgress: @escaping @Sendable (LootSearchProgress) -> Void
+    ) async throws -> [MapLootPresentation] {
+        guard query.radius > 0 else {
+            throw BrowserAppError.message("Radius must be greater than zero.")
+        }
+        guard query.radius <= 10_000 else {
+            throw BrowserAppError.message("Radius is limited to 10,000 blocks.")
+        }
+        let itemQuery = query.itemQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !itemQuery.isEmpty else {
+            throw BrowserAppError.message("Enter an item, enchantment, potion, or effect to search for.")
+        }
+        guard let dataPack else {
+            throw BrowserAppError.message("Structure generation worker is not ready.")
+        }
+        let worldSeed = UInt64(bitPattern: seed)
+        try configureGenerator(for: worldSeed, dimensionID: "minecraft:overworld", using: dataPack)
+        guard let generator else { throw BrowserAppError.message("Structure generation worker is not ready.") }
+        let minimum = -query.radius
+        let maximum = query.radius
+        let minX = query.startX &+ minimum
+        let maxX = query.startX &+ maximum
+        let minZ = query.startZ &+ minimum
+        let maxZ = query.startZ &+ maximum
+        let structures = try structures(
+            in: StructureQuery(
+                seed: worldSeed,
+                dimensionID: "minecraft:overworld",
+                minX: minX, maxX: maxX, minZ: minZ, maxZ: maxZ,
+                enabledStructureSets: Set(structureSetDescriptors.map(\.keyName)),
+                minimumSpacingBlocks: 0
+            ),
+            biomeSampler: { position in
+                try generator.sampleBiome(at: position, in: self.dimensionKey(for: "minecraft:overworld"))
+            }
+        )?.points ?? []
+        var matches: [MapLootPresentation] = []
+        for (index, structure) in structures.enumerated() {
+            try Task.checkCancellation()
+            let presentation = MapStructurePresentation(
+                setID: structure.setID, structureID: structure.structureID, x: structure.x, z: structure.z
+            )
+            onProgress(LootSearchProgress(
+                structuresScanned: index, totalStructures: structures.count, currentStructure: presentation
+            ))
+            let newMatches: [MapLootPresentation] = try loot(for: structure, seed: worldSeed).compactMap { container -> MapLootPresentation? in
+                guard container.loot.contains(where: { LootSearchMatcher.matches(item: $0, query: itemQuery) }) else {
+                    return nil
+                }
+                return MapLootPresentation(
+                    block: container.block, lootTable: container.lootTable,
+                    x: container.x, y: container.y, z: container.z, items: container.loot
+                )
+            }
+            matches.append(contentsOf: newMatches)
+            onProgress(LootSearchProgress(
+                structuresScanned: index + 1, totalStructures: structures.count,
+                currentStructure: presentation, matches: newMatches
+            ))
+        }
+        return matches.sorted { ($0.z, $0.x, $0.y, $0.block) < ($1.z, $1.x, $1.y, $1.block) }
     }
 
     // Structure starts are generated as part of a tile after its biome cache exists. Keep the
@@ -741,6 +812,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 for: container.lootTable,
                 seed: container.lootSeed,
                 rootURL: rootURL,
+                decoder: dataPack.makeDecoder(),
                 enchantmentResources: dataPack.lootEnchantmentResources
             )) ?? []
             resolvedContainers.append(LootContainerPoint(
@@ -759,6 +831,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         for tableID: String,
         seed: Int64,
         rootURL: URL,
+        decoder: JSONDecoder,
         enchantmentResources: LootEnchantmentResources
     ) throws -> [String] {
         func loadLootTable(_ identifier: String) throws -> LootTable {
@@ -766,7 +839,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             let namespace = parts.count == 2 ? String(parts[0]) : "minecraft"
             let path = parts.count == 2 ? String(parts[1]) : identifier
             let tableURL = rootURL.appendingPathComponent("data/\(namespace)/loot_table/\(path).json")
-            return try JSONDecoder().decode(LootTable.self, from: Data(contentsOf: tableURL))
+            return try decoder.decode(LootTable.self, from: Data(contentsOf: tableURL))
         }
 
         let table = try loadLootTable(tableID)
@@ -814,7 +887,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
 
             if case .object(let potionComponent)? = components["minecraft:potion_contents"],
                let potion = stringValue(potionComponent["potion"]) {
-                metadata.append("Potion: \(titleCaseID(potion))")
+                metadata.append("Potion: \(potion) (\(titleCaseID(potion)))")
             }
 
             if case .array(let effects)? = components["minecraft:suspicious_stew_effects"] {
@@ -822,9 +895,9 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                     guard case .object(let values) = effect,
                           let id = stringValue(values["id"]) else { return nil }
                     if let duration = integerValue(values["duration"]) {
-                        return "\(titleCaseID(id)) (\(duration) ticks)"
+                        return "\(id) (\(titleCaseID(id)), \(duration) ticks)"
                     }
-                    return titleCaseID(id)
+                    return "\(id) (\(titleCaseID(id)))"
                 }
                 if !descriptions.isEmpty {
                     metadata.append("Effects: " + descriptions.joined(separator: ", "))
@@ -1211,7 +1284,14 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     }
 
     private func materialize(bundle: DatapackBundle) throws -> URL {
+        let identifier = bundle.id ?? "default"
+        guard !identifier.isEmpty,
+              identifier.allSatisfy({ $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "." || $0 == "-") })
+        else {
+            throw BrowserAppError.message("Datapack bundle has an invalid identifier.")
+        }
         let rootURL = URL(fileURLWithPath: runtimeDatapackPath, isDirectory: true)
+            .appendingPathComponent(identifier, isDirectory: true)
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: rootURL, withIntermediateDirectories: true, attributes: nil)
         for file in bundle.files {
@@ -1231,6 +1311,33 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             try contents.write(to: url)
         }
         return rootURL
+    }
+
+    /// A newly selected version must never reuse a generator or sampler compiled against the
+    /// previous pack. The browser keeps each materialised pack in its own directory so an older
+    /// in-flight loot read cannot observe replacement files.
+    private func resetForDatapackReload() {
+        dataPack = nil
+        currentSeed = nil
+        currentDimensionID = nil
+        generator = nil
+        usesNativeBulkSampler = false
+        densityCompilationMilliseconds = nil
+        densityCompilationBackend = nil
+        samplers.removeAll(keepingCapacity: true)
+        structureSampler = nil
+        structureSetDescriptors.removeAll(keepingCapacity: true)
+        validatedStructureStarts.removeAll(keepingCapacity: true)
+        rejectedStructureStarts.removeAll(keepingCapacity: true)
+        randomStructurePlacements.removeAll(keepingCapacity: true)
+        emptyRandomStructureRegions.removeAll(keepingCapacity: true)
+        concentricStructurePlacements.removeAll(keepingCapacity: true)
+        structureHeightmapSampler = nil
+        dataPackRoot = nil
+#if os(WASI)
+        wasmRuntime?.invalidate()
+        wasmRuntime = nil
+#endif
     }
 
 }

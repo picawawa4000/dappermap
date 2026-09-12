@@ -20,8 +20,41 @@ let defaultSampleY: Int32 = 256
 // Frequency-based structure sets (notably mineshafts) can have a tiny placement spacing. Give
 // them a practical coarse-zoom cutoff without hiding them at normal map scales.
 let minimumFrequencyStructureWorldSpacing = 256.0
-let defaultBundlePath = "./Web/default-datapack.bundle.json.gz"
-let runtimeDatapackPath = "./.dappermap/runtime/default-datapack"
+public struct VanillaDatapack: Equatable, Sendable {
+    public let version: String
+    public let bundlePath: String
+    /// The format used by the extracted native datapack, which does not include a root
+    /// `pack.mcmeta` file from the Minecraft client jar.
+    public let packFormat: Version
+
+    public var nativeDataDirectory: String {
+        "Data/\(version)"
+    }
+
+    public init(version: String, bundlePath: String, packFormat: Version) {
+        self.version = version
+        self.bundlePath = bundlePath
+        self.packFormat = packFormat
+    }
+}
+
+/// Each entry is the first release with a distinct vanilla worldgen state. Patch releases that
+/// only changed unrelated game data use the preceding world's datapack.
+public let vanillaDatapacks: [VanillaDatapack] = [
+    VanillaDatapack(version: "1.21", bundlePath: "./Web/vanilla-1.21-datapack.bundle.json.gz", packFormat: Version(major: 48, minor: 0)),
+    VanillaDatapack(version: "1.21.2", bundlePath: "./Web/vanilla-1.21.2-datapack.bundle.json.gz", packFormat: Version(major: 57, minor: 0)),
+    VanillaDatapack(version: "1.21.4", bundlePath: "./Web/vanilla-1.21.4-datapack.bundle.json.gz", packFormat: Version(major: 61, minor: 0)),
+    VanillaDatapack(version: "1.21.5", bundlePath: "./Web/vanilla-1.21.5-datapack.bundle.json.gz", packFormat: Version(major: 71, minor: 0)),
+    VanillaDatapack(version: "1.21.6", bundlePath: "./Web/vanilla-1.21.6-datapack.bundle.json.gz", packFormat: Version(major: 80, minor: 0)),
+    VanillaDatapack(version: "1.21.9", bundlePath: "./Web/vanilla-1.21.9-datapack.bundle.json.gz", packFormat: Version(major: 88, minor: 0)),
+    VanillaDatapack(version: "1.21.11", bundlePath: "./Web/vanilla-1.21.11-datapack.bundle.json.gz", packFormat: Version(major: 94, minor: 1)),
+    VanillaDatapack(version: "26.1", bundlePath: "./Web/vanilla-26.1-datapack.bundle.json.gz", packFormat: Version(major: 101, minor: 1)),
+    VanillaDatapack(version: "26.2", bundlePath: "./Web/vanilla-26.2-datapack.bundle.json.gz", packFormat: Version(major: 107, minor: 1)),
+    VanillaDatapack(version: "26.3-pre-1", bundlePath: "./Web/vanilla-26.3-pre-1-datapack.bundle.json.gz", packFormat: Version(major: 119, minor: 0))
+]
+
+public let defaultVanillaDatapack = vanillaDatapacks[6]
+let runtimeDatapackPath = "./.dappermap/runtime"
 
 public enum MapMath {
     public static let tileSize = 256
@@ -76,6 +109,7 @@ public enum MapMath {
 }
 
 struct DatapackBundle: Decodable {
+    let id: String?
     let files: [DatapackBundleFile]
 }
 

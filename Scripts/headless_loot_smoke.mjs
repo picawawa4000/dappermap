@@ -94,7 +94,7 @@ console.error(`dom:${JSON.stringify(await evaluate(`({
     currentStatus: document.querySelector("#status")?.innerText ?? ""
 })`))}`);
 console.error("waiting:datapack");
-await waitFor(`document.querySelector("#status")?.innerText === "Datapack ready. Enter a seed and click Render."`);
+await waitFor(`document.querySelector("#status")?.innerText.endsWith("datapack ready. Enter a seed and click Render.")`);
 console.error("ready:datapack");
 
 await evaluate(`(() => {

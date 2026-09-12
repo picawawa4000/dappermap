@@ -9,4 +9,4 @@ Not everything in here is necessarily about DapperMap; some of it is for DPReade
 - Ruined portals in the Nether do not have the correct loot (probably RNG nonsense).
 - Ocean ruin suspicious blocks are incorrect.
 - Explorer maps appear to crash loot table resolution.
-- Many structures are still unimplemented.
+- End city enchantments are wrong.

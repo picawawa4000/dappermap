@@ -67,6 +67,7 @@ let vanillaBiomeDefaults: [String: BiomeColor] = [
     "minecraft:snowy_taiga": BiomeColor(red: 190, green: 210, blue: 220),
     "minecraft:soul_sand_valley": BiomeColor(red: 100, green: 80, blue: 60),
     "minecraft:sparse_jungle": BiomeColor(red: 50, green: 160, blue: 60),
+    "minecraft:sulfur_caves": BiomeColor(red: 190, green: 180, blue: 55),
     "minecraft:stony_peaks": BiomeColor(red: 130, green: 130, blue: 130),
     "minecraft:stony_shore": BiomeColor(red: 120, green: 120, blue: 120),
     "minecraft:sunflower_plains": BiomeColor(red: 130, green: 190, blue: 75),

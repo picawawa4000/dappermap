@@ -19,6 +19,7 @@ import WASILibc
 final class BrowserApp: DapperMapPlatform {
     private let document: JSObject
     private let viewport: JSObject
+    private let minecraftVersionInput: JSObject
     private let seedInput: JSObject
     private let dimensionInput: JSObject
     private let yInput: JSObject
@@ -42,6 +43,15 @@ final class BrowserApp: DapperMapPlatform {
     private let lootFilterInput: JSObject
     private let lootMessageElement: JSObject
     private let lootListElement: JSObject
+    private let lootSearchXInput: JSObject
+    private let lootSearchZInput: JSObject
+    private let lootSearchRadiusInput: JSObject
+    private let lootSearchItemInput: JSObject
+    private let lootSearchButton: JSObject
+    private let lootSearchMessageElement: JSObject
+    private let lootSearchProgressElement: JSObject
+    private let lootSearchCurrentElement: JSObject
+    private let lootSearchListElement: JSObject
     private let debugLastTileElement: JSObject
     private let debugGenerationTimeElement: JSObject
     private let debugDensityCompilationElement: JSObject
@@ -69,6 +79,7 @@ final class BrowserApp: DapperMapPlatform {
     private var retainedClosures: [JSClosure] = []
     private var pendingTimer: JSTimer?
     private var generatorReady = false
+    private var datapackLoadGeneration = 0
     private var currentSeed: WorldSeed?
     private var currentSampleY: Int32 = defaultSampleY
     private var currentDimensionID = "minecraft:overworld"
@@ -114,6 +125,10 @@ final class BrowserApp: DapperMapPlatform {
     private var activeLootRequest = 0
     private var lootContainerDetails: [LootContainerPoint: JSObject] = [:]
     private var inFlightLootTask: Task<Void, Never>?
+    private var inFlightLootSearchTask: Task<Void, Never>?
+    private var lootSearchResults: [MapLootPresentation] = []
+    private var lootSearchGroups: [(structure: MapStructurePresentation, containers: [MapLootPresentation])] = []
+    private var lootSearchRequest = 0
     private var viewCenterX = 0.0
     private var viewCenterZ = 0.0
     private var viewBlocksPerPixel = 1.0
@@ -138,6 +153,7 @@ final class BrowserApp: DapperMapPlatform {
         self.tileGenerator = tileGenerator
         self.document = JSObject.global.document.object!
         self.viewport = document.getElementById!("map-viewport").object!
+        self.minecraftVersionInput = document.getElementById!("minecraft-version-input").object!
         self.seedInput = document.getElementById!("seed-input").object!
         self.dimensionInput = document.getElementById!("dimension-input").object!
         self.yInput = document.getElementById!("y-input").object!
@@ -161,6 +177,15 @@ final class BrowserApp: DapperMapPlatform {
         self.lootFilterInput = document.getElementById!("loot-filter-input").object!
         self.lootMessageElement = document.getElementById!("loot-message").object!
         self.lootListElement = document.getElementById!("loot-list").object!
+        self.lootSearchXInput = document.getElementById!("loot-search-x").object!
+        self.lootSearchZInput = document.getElementById!("loot-search-z").object!
+        self.lootSearchRadiusInput = document.getElementById!("loot-search-radius").object!
+        self.lootSearchItemInput = document.getElementById!("loot-search-item").object!
+        self.lootSearchButton = document.getElementById!("loot-search-button").object!
+        self.lootSearchMessageElement = document.getElementById!("loot-search-message").object!
+        self.lootSearchProgressElement = document.getElementById!("loot-search-progress").object!
+        self.lootSearchCurrentElement = document.getElementById!("loot-search-current").object!
+        self.lootSearchListElement = document.getElementById!("loot-search-list").object!
         self.debugLastTileElement = document.getElementById!("debug-last-tile").object!
         self.debugGenerationTimeElement = document.getElementById!("debug-generation-time").object!
         self.debugDensityCompilationElement = document.getElementById!("debug-density-compilation").object!
@@ -211,9 +236,8 @@ final class BrowserApp: DapperMapPlatform {
         attachHandlers()
         renderLootPanel(message: nil)
         setLoading(true)
-        setStatus("Loading Minecraft 1.21.11 datapack…")
         scheduleNextTick { [weak self] in
-            self?.loadDefaultDatapack()
+            self?.loadSelectedDatapack()
         }
     }
 
@@ -317,6 +341,13 @@ final class BrowserApp: DapperMapPlatform {
         retainedClosures.append(dimensionChangeClosure)
         _ = dimensionInput.addEventListener!("change", dimensionChangeClosure)
 
+        let versionChangeClosure = JSClosure { [weak self] _ in
+            self?.loadSelectedDatapack()
+            return .undefined
+        }
+        retainedClosures.append(versionChangeClosure)
+        _ = minecraftVersionInput.addEventListener!("change", versionChangeClosure)
+
         let biomeResetClosure = JSClosure { [weak self] _ in
             self?.resetBiomeColorsToDefaults()
             return .undefined
@@ -339,6 +370,13 @@ final class BrowserApp: DapperMapPlatform {
         }
         retainedClosures.append(lootFilterClosure)
         _ = lootFilterInput.addEventListener!("input", lootFilterClosure)
+
+        let lootSearchClosure = JSClosure { [weak self] _ in
+            self?.startLootSearch()
+            return .undefined
+        }
+        retainedClosures.append(lootSearchClosure)
+        _ = lootSearchButton.addEventListener!("click", lootSearchClosure)
 
         let biomeImportButtonClosure = JSClosure { [weak self] _ in
             self?.biomeImportInput.value = "".jsValue
@@ -478,9 +516,21 @@ final class BrowserApp: DapperMapPlatform {
         }
     }
 
-    private func loadDefaultDatapack() {
-        fetchText(at: defaultBundlePath) { [weak self] (result: Result<String, BrowserAppError>) in
+    private func loadSelectedDatapack() {
+        let selectedVersion = minecraftVersionInput.value.string ?? defaultVanillaDatapack.version
+        guard let datapack = vanillaDatapacks.first(where: { $0.version == selectedVersion }) else {
+            setStatus("The selected Minecraft version is not bundled.", isError: true)
+            return
+        }
+
+        datapackLoadGeneration += 1
+        let loadGeneration = datapackLoadGeneration
+        invalidateForDatapackReload()
+        setLoading(true)
+        setStatus("Loading Minecraft \(datapack.version) datapack…")
+        fetchText(at: datapack.bundlePath) { [weak self] (result: Result<String, BrowserAppError>) in
             guard let self else { return }
+            guard loadGeneration == self.datapackLoadGeneration else { return }
             switch result {
             case .failure(let error):
                 self.setLoading(false)
@@ -489,29 +539,70 @@ final class BrowserApp: DapperMapPlatform {
                 // The tile worker owns the materialised DataPack. Retaining one here as well
                 // duplicates its large registries in shared WebAssembly memory and can force a
                 // WebKit-hostile memory growth before the first render.
-                self.startTileGenerator(bundleText: text)
+                self.startTileGenerator(bundleText: text, version: datapack.version, loadGeneration: loadGeneration)
             }
         }
     }
 
-    private func startTileGenerator(bundleText: String) {
+    private func startTileGenerator(bundleText: String, version: String, loadGeneration: Int) {
         setStatus("Compiling density functions…")
         Task { [weak self] in
             guard let self else { return }
             do {
                 try await self.tileGenerator.initialize(bundleText: bundleText)
                 let metadata = await self.tileGenerator.browserRegistryMetadata()
+                guard loadGeneration == self.datapackLoadGeneration else { return }
                 self.reloadDimensionPicker(using: metadata.dimensionIDs)
                 self.reloadBiomeEditor(using: metadata.biomeIDs)
                 self.reloadStructureEditor(using: metadata.structureSets)
                 self.generatorReady = true
                 self.setLoading(false)
-                self.setStatus("Datapack ready. Enter a seed and click Render.")
+                self.setStatus("Minecraft \(version) datapack ready. Enter a seed and click Render.")
             } catch {
+                guard loadGeneration == self.datapackLoadGeneration else { return }
                 self.setLoading(false)
                 self.setStatus("Failed to start tile generation worker: \(error)", isError: true)
             }
         }
+    }
+
+    private func invalidateForDatapackReload() {
+        generatorReady = false
+        currentSeed = nil
+        currentDimensionID = "minecraft:overworld"
+        activeViewGeneration += 1
+        requestedStructureGeneration = nil
+        inFlightTileTask?.cancel()
+        inFlightTileTask = nil
+        inFlightTileJob = nil
+        inFlightTileStructureTask?.cancel()
+        inFlightTileStructureTask = nil
+        inFlightTileStructureJob = nil
+        inFlightStructureTask?.cancel()
+        inFlightStructureTask = nil
+        inFlightConcentricStructureTask?.cancel()
+        inFlightConcentricStructureTask = nil
+        inFlightLootTask?.cancel()
+        inFlightLootTask = nil
+        pendingRenderTimer = nil
+        pendingTileTimer = nil
+        pendingTileJobs.removeAll(keepingCapacity: true)
+        pendingTileStructureJobs.removeAll(keepingCapacity: true)
+        tileCache.removeAll(keepingCapacity: true)
+        tileAtlas = nil
+        fallbackTileAtlas = nil
+        releaseAtlasCanvases()
+        visibleStructurePoints.removeAll(keepingCapacity: true)
+        visibleLootContainers.removeAll(keepingCapacity: true)
+        activeLootStructure = nil
+        activeLootRequest += 1
+        context.fillStyle = placeholderColor.jsValue
+        _ = context.fillRect!(0, 0, viewportWidth, viewportHeight)
+        _ = overlayContext.clearRect!(0, 0, viewportWidth, viewportHeight)
+        setBiomeGenerationStatus("Biomes: waiting for datapack.")
+        setStructureGenerationStatus("Structures: waiting for datapack.")
+        renderLootPanel(message: nil)
+        updateDebugPanel()
     }
 
     private func prepareRender() {
@@ -1125,6 +1216,7 @@ final class BrowserApp: DapperMapPlatform {
     }
 
     private func setLoading(_ loading: Bool) {
+        minecraftVersionInput.disabled = loading.jsValue
         renderButton.disabled = loading.jsValue
         seedInput.disabled = loading.jsValue
     }
@@ -2071,6 +2163,103 @@ final class BrowserApp: DapperMapPlatform {
 
     private func showLootPage() {
         _ = JSObject.global.dappermapShowPage?("loot".jsValue)
+    }
+
+    private func startLootSearch() {
+        guard let seed = currentSeed else {
+            renderLootSearch(message: "Render a seed before searching.", isError: true)
+            return
+        }
+        guard let x = Int32(lootSearchXInput.value.string ?? ""),
+              let z = Int32(lootSearchZInput.value.string ?? ""),
+              let radius = Int32(lootSearchRadiusInput.value.string ?? "") else {
+            renderLootSearch(message: "Start X, Start Z, and radius must be whole numbers.", isError: true)
+            return
+        }
+        let query = LootSearchQuery(startX: x, startZ: z, radius: radius, itemQuery: lootSearchItemInput.value.string ?? "")
+        inFlightLootSearchTask?.cancel()
+        lootSearchRequest += 1
+        let request = lootSearchRequest
+        lootSearchResults = []
+        lootSearchGroups = []
+        lootSearchProgressElement.max = 1.jsValue
+        lootSearchProgressElement.value = 0.jsValue
+        lootSearchCurrentElement.innerText = "Finding structures…".jsValue
+        renderLootSearch(message: "Searching chests…", isError: false)
+        inFlightLootSearchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let results = try await self.tileGenerator.searchLoot(query, seed: Int64(bitPattern: seed)) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        guard let self, request == self.lootSearchRequest else { return }
+                        self.applyLootSearch(progress)
+                    }
+                }
+                guard !Task.isCancelled else { return }
+                guard request == self.lootSearchRequest else { return }
+                self.lootSearchCurrentElement.innerText = "Done.".jsValue
+                self.renderLootSearchGroups(message: results.isEmpty ? "No matching chests found." : "Found \(results.count) matching chest\(results.count == 1 ? "" : "s").")
+            } catch is CancellationError {
+            } catch {
+                self.renderLootSearch(message: "Loot search failed: \(error)", isError: true)
+            }
+        }
+    }
+
+    private func applyLootSearch(_ progress: LootSearchProgress) {
+        lootSearchResults.append(contentsOf: progress.matches)
+        if let structure = progress.currentStructure, !progress.matches.isEmpty {
+            lootSearchGroups.append((structure, progress.matches))
+        }
+        lootSearchProgressElement.max = Double(max(1, progress.totalStructures)).jsValue
+        lootSearchProgressElement.value = Double(progress.structuresScanned).jsValue
+        if let structure = progress.currentStructure {
+            lootSearchCurrentElement.innerText = "Generating: \(structure.structureID) at (\(structure.x), \(structure.z)) — \(progress.structuresScanned)/\(progress.totalStructures)".jsValue
+        }
+        renderLootSearchGroups(message: "Found \(lootSearchResults.count) matching chest\(lootSearchResults.count == 1 ? "" : "s") so far.")
+    }
+
+    private func renderLootSearchGroups(message: String, isError: Bool = false) {
+        lootSearchMessageElement.innerText = message.jsValue
+        lootSearchMessageElement.className = (isError ? "status error" : "status").jsValue
+        lootSearchListElement.innerHTML = "".jsValue
+        for group in lootSearchGroups {
+            let details = document.createElement!("details").object!
+            details.className = "loot-container".jsValue
+            let summary = document.createElement!("summary").object!
+            summary.innerText = "\(group.structure.structureID) at (\(group.structure.x), \(group.structure.z)) — \(group.containers.count) matching chest\(group.containers.count == 1 ? "" : "s")".jsValue
+            _ = details.appendChild!(summary)
+            let list = document.createElement!("div").object!
+            list.className = "loot-list".jsValue
+            for container in group.containers { appendLootSearchContainer(container, to: list) }
+            _ = details.appendChild!(list)
+            _ = lootSearchListElement.appendChild!(details)
+        }
+    }
+
+    private func renderLootSearch(results: [MapLootPresentation] = [], message: String, isError: Bool = false) {
+        lootSearchMessageElement.innerText = message.jsValue
+        lootSearchMessageElement.className = (isError ? "status error" : "status").jsValue
+        lootSearchListElement.innerHTML = "".jsValue
+        for container in results { appendLootSearchContainer(container, to: lootSearchListElement) }
+    }
+
+    private func appendLootSearchContainer(_ container: MapLootPresentation, to parent: JSObject) {
+        let details = document.createElement!("details").object!
+        details.className = "loot-container".jsValue
+        let summary = document.createElement!("summary").object!
+        summary.innerText = "\(container.block) at (\(container.x), \(container.y), \(container.z))".jsValue
+        _ = details.appendChild!(summary)
+        let items = document.createElement!("ul").object!
+        items.className = "loot-items".jsValue
+        for item in container.items {
+            let row = document.createElement!("li").object!
+            row.innerText = item.jsValue
+            if LootSearchMatcher.matches(item: item, query: lootSearchItemInput.value.string ?? "") { row.className = "loot-item-match".jsValue }
+            _ = items.appendChild!(row)
+        }
+        _ = details.appendChild!(items)
+        _ = parent.appendChild!(details)
     }
 
     private func renderLootPanel(message: String?, isError: Bool = false) {

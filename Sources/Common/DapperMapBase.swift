@@ -66,6 +66,59 @@ public struct MapLootPresentation: Hashable, Sendable {
     }
 }
 
+/// A square world-area loot query. `radius` is half the length of each side in blocks.
+public struct LootSearchQuery: Sendable {
+    public let startX: Int32
+    public let startZ: Int32
+    public let radius: Int32
+    public let itemQuery: String
+
+    public init(startX: Int32, startZ: Int32, radius: Int32, itemQuery: String) {
+        self.startX = startX
+        self.startZ = startZ
+        self.radius = radius
+        self.itemQuery = itemQuery
+    }
+}
+
+/// An incremental loot-search update. `matches` contains only containers found since the prior
+/// update, allowing every frontend to show results while generation is still in progress.
+public struct LootSearchProgress: Sendable {
+    public let structuresScanned: Int
+    public let totalStructures: Int
+    public let currentStructure: MapStructurePresentation?
+    public let matches: [MapLootPresentation]
+
+    public init(structuresScanned: Int, totalStructures: Int, currentStructure: MapStructurePresentation?, matches: [MapLootPresentation] = []) {
+        self.structuresScanned = structuresScanned
+        self.totalStructures = totalStructures
+        self.currentStructure = currentStructure
+        self.matches = matches
+    }
+}
+
+/// Human-friendly matching for the formatted generated-loot descriptions.
+/// Terms are ANDed. The optional `item:`, `enchant:`, `potion:`, and `effect:` prefixes are
+/// documentation-oriented aliases; their value is matched case-insensitively.
+public enum LootSearchMatcher {
+    public static func matches(item: String, query: String) -> Bool {
+        let text = item.lowercased()
+        let terms = query.lowercased().split(whereSeparator: \ .isWhitespace)
+        return terms.allSatisfy { rawTerm in
+            let term = String(rawTerm)
+            let value: String
+            let parts = term.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
+            if parts.count == 2,
+               ["item", "enchant", "potion", "effect"].contains(String(parts[0])) {
+                value = String(parts[1])
+            } else {
+                value = term
+            }
+            return !value.isEmpty && text.contains(value)
+        }
+    }
+}
+
 public struct MapTooltipPresentation: Equatable, Sendable {
     public let text: String
     public let screenX: Double
@@ -138,6 +191,8 @@ public protocol DapperMapPlatform: AnyObject {
 public protocol DapperMapGenerationPlatform: Sendable {
     func generateTile(_ request: MapTileRequest) async throws -> MapTilePresentation
     func generateLoot(for structure: MapStructurePresentation, seed: Int64) async throws -> [MapLootPresentation]
+    func searchLoot(_ query: LootSearchQuery, seed: Int64) async throws -> [MapLootPresentation]
+    func searchLoot(_ query: LootSearchQuery, seed: Int64, onProgress: @escaping @Sendable (LootSearchProgress) -> Void) async throws -> [MapLootPresentation]
 }
 
 public struct MapTileRequest: Sendable {
@@ -248,6 +303,17 @@ public final class DapperMapBase {
                     id: "loot-help",
                     label: "",
                     value: "Click a structure marker to reveal supported loot containers. Hover a container marker for its position and generated loot.",
+                    kind: .text
+                )]
+            ),
+            SidebarTab(
+                id: "loot-search",
+                title: "Loot Search",
+                heading: "Loot Search",
+                fields: [SidebarField(
+                    id: "loot-search-help",
+                    label: "",
+                    value: "Search every supported generated chest in the square centered on Start X/Z; radius is the distance from that center to an edge. Enter words that must all be present, such as diamond sword. Prefix a word with item:, enchant:, potion:, or effect: to make its purpose clear: item:diamond_sword, enchant:sharpness 5, potion:healing, or effect:night_vision.",
                     kind: .text
                 )]
             ),

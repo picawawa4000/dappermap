@@ -1,8 +1,6 @@
 import DPReader
 import Foundation
 
-private let bundlePath = URL(fileURLWithPath: "Web/default-datapack.bundle.json.gz")
-private let runtimeRoot = URL(fileURLWithPath: "/private/tmp/dappermap-bench-default-datapack", isDirectory: true)
 private let mapSize = 256
 private let halfMapSize = Int32(mapSize / 2)
 private let sampleY: Int32 = 256
@@ -68,6 +66,9 @@ private struct StageTimer {
 @main
 enum BenchStart {
     static func main() throws {
+        let version = CommandLine.arguments.dropFirst().first ?? "1.21.11"
+        let bundlePath = URL(fileURLWithPath: "Web/vanilla-\(version)-datapack.bundle.json.gz")
+        let runtimeRoot = URL(fileURLWithPath: "/private/tmp/dappermap-bench-\(version)-datapack", isDirectory: true)
         let timer = StageTimer()
         let fileManager = FileManager.default
 
@@ -108,8 +109,7 @@ enum BenchStart {
                     .noStructures,
                     .noStructureSets,
                     .noStructureTemplates
-                ],
-                decodingVersion: .assumedCurrent
+                ]
             )
         }
 

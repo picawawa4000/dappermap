@@ -9,10 +9,12 @@ DerivedData/
 Package.resolved
 .vscode/
 # Vanilla data packs.
-# Download the vanilla data packs into Data/<version> (currently only 1.21.11 is supported).
-# Use Scripts/generate_default_datapack_bundle.py to get the compressed data pack.
+# Download the vanilla data packs into Data/<version> with DPReader's
+# Scripts/extract_vanilla_datapack.py. Packs are automatically bundled
+# upon running the web build; they can be manually produced via
+# Scripts/generate_default_datapack_bundle.py --version <version>.
 Data/
-Web/
+Web/*
 # Swift stuff
 .dappermap
 .swiftpm-cache

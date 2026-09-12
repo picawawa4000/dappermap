@@ -25,6 +25,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
     private let panelHost = NSView(frame: .zero)
     private var panels: [String: NSView] = [:]
     private var orderedTabIDs: [String] = []
+    private var minecraftVersionInput: NSPopUpButton?
     private var seedInput: NSTextField?
     private var dimensionInput: NSPopUpButton?
     private var yInput: NSTextField?
@@ -41,12 +42,24 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
     private var lootContainers: [MapLootPresentation] = []
     private var lootMessage: String?
     private var lootMessageIsError = false
+    private var lootSearchXInput: NSTextField?
+    private var lootSearchZInput: NSTextField?
+    private var lootSearchRadiusInput: NSTextField?
+    private var lootSearchItemInput: NSTextField?
+    private var lootSearchText: NSTextView?
+    private var lootSearchProgress: NSProgressIndicator?
+    private var lootSearchCurrentLabel: NSTextField?
+    private var lootSearchResults: [MapLootPresentation] = []
+    private var lootSearchGroups: [(structure: MapStructurePresentation, containers: [MapLootPresentation])] = []
+    private var lootSearchRequest = 0
+    private var lootSearchTask: Task<Void, Never>?
     private var debugLabel: NSTextField?
     private var threadField: NSTextField?
     private var threadStepper: NSStepper?
     private lazy var commonBase = DapperMapBase(platform: self)
     private var scheduler: NativeGenerationPlatform?
     private var dataPackRoot: URL?
+    private var selectedDatapack = defaultVanillaDatapack
     private var threadCount: Int
     private var generation = 0
     private var renderTask: Task<Void, Never>?
@@ -248,12 +261,23 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
 
         switch tab.id {
         case "map":
+            stack.addArrangedSubview(label("Minecraft Version", size: 15, bold: true))
+            let versionPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+            versionPicker.addItems(withTitles: vanillaDatapacks.map(\.version))
+            versionPicker.selectItem(withTitle: selectedDatapack.version)
+            versionPicker.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            versionPicker.target = self
+            versionPicker.action = #selector(minecraftVersionChanged)
+            stack.addArrangedSubview(versionPicker)
+            minecraftVersionInput = versionPicker
             let seedField = tab.fields.first { $0.id == "seed" }
             let dimensionField = tab.fields.first { $0.id == "dimension" }
             let yFieldPresentation = tab.fields.first { $0.id == "y" }
             let seedLabel = label(seedField?.label ?? "Seed", size: 15, bold: true)
             stack.addArrangedSubview(seedLabel)
             let input = NSTextField(string: seedField?.value ?? "0")
+            input.isEditable = true
+            input.isSelectable = true
             input.font = NSFont(name: "Menlo", size: 13) ?? .monospacedSystemFont(ofSize: 13, weight: .regular)
             input.widthAnchor.constraint(equalToConstant: 324).isActive = true
             input.target = self
@@ -282,7 +306,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             button.widthAnchor.constraint(equalToConstant: 324).isActive = true
             stack.addArrangedSubview(button)
             stack.addArrangedSubview(label("Status", size: 15, bold: true))
-            let status = wrappingLabel("Loading Minecraft 1.21.11 datapack…")
+            let status = wrappingLabel("Loading Minecraft \(selectedDatapack.version) datapack…")
             status.widthAnchor.constraint(equalToConstant: 324).isActive = true
             stack.addArrangedSubview(status)
             statusLabel = status
@@ -331,6 +355,51 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             scroll.heightAnchor.constraint(equalToConstant: 420).isActive = true
             stack.addArrangedSubview(scroll)
             lootText = text
+        case "loot-search":
+            if let help = tab.fields.first?.value {
+                let helpLabel = wrappingLabel(help)
+                helpLabel.widthAnchor.constraint(equalToConstant: 324).isActive = true
+                stack.addArrangedSubview(helpLabel)
+            }
+            let fields: [(String, String, ReferenceWritableKeyPath<NativeAppController, NSTextField?>)] = [
+                ("Start X", "0", \NativeAppController.lootSearchXInput),
+                ("Start Z", "0", \NativeAppController.lootSearchZInput),
+                ("Radius", "1000", \NativeAppController.lootSearchRadiusInput),
+                ("Item or descriptor", "", \NativeAppController.lootSearchItemInput)
+            ]
+            for (name, value, keyPath) in fields {
+                stack.addArrangedSubview(label(name, size: 12, bold: true))
+                let field = NSTextField(string: value)
+                field.widthAnchor.constraint(equalToConstant: 324).isActive = true
+                stack.addArrangedSubview(field)
+                self[keyPath: keyPath] = field
+            }
+            let button = NSButton(title: "Search Chests", target: self, action: #selector(searchLoot))
+            button.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            stack.addArrangedSubview(button)
+            let progress = NSProgressIndicator()
+            progress.isIndeterminate = false
+            progress.minValue = 0
+            progress.maxValue = 1
+            progress.doubleValue = 0
+            progress.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            stack.addArrangedSubview(progress)
+            lootSearchProgress = progress
+            let current = wrappingLabel("Waiting to search.")
+            current.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            stack.addArrangedSubview(current)
+            lootSearchCurrentLabel = current
+            let scroll = NSScrollView()
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .bezelBorder
+            let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 324, height: 360))
+            text.isEditable = false
+            text.drawsBackground = false
+            scroll.documentView = text
+            scroll.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            scroll.heightAnchor.constraint(equalToConstant: 360).isActive = true
+            stack.addArrangedSubview(scroll)
+            lootSearchText = text
         case "debug":
             for field in tab.fields where field.id == "threads" {
                 stack.addArrangedSubview(label(field.label, size: 12, bold: true))
@@ -513,6 +582,75 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         renderLootText()
     }
 
+    @objc private func searchLoot() {
+        guard let scheduler, let seed = currentSeed else {
+            renderLootSearchText("Render a seed before searching.")
+            return
+        }
+        guard let x = Int32(lootSearchXInput?.stringValue ?? ""),
+              let z = Int32(lootSearchZInput?.stringValue ?? ""),
+              let radius = Int32(lootSearchRadiusInput?.stringValue ?? "") else {
+            renderLootSearchText("Start X, Start Z, and radius must be whole numbers.")
+            return
+        }
+        let query = LootSearchQuery(startX: x, startZ: z, radius: radius, itemQuery: lootSearchItemInput?.stringValue ?? "")
+        renderLootSearchText("Searching chests…")
+        lootSearchTask?.cancel()
+        lootSearchRequest += 1
+        let request = lootSearchRequest
+        lootSearchResults = []
+        lootSearchGroups = []
+        lootSearchProgress?.maxValue = 1
+        lootSearchProgress?.doubleValue = 0
+        lootSearchCurrentLabel?.stringValue = "Finding structures…"
+        lootSearchTask = Task { [weak self] in
+            do {
+                let results = try await scheduler.searchLoot(query, seed: seed) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        guard let self, request == self.lootSearchRequest else { return }
+                        self.applyLootSearch(progress)
+                    }
+                }
+                guard !Task.isCancelled else { return }
+                await MainActor.run { [weak self] in
+                    guard let self, request == self.lootSearchRequest else { return }
+                    let header = results.isEmpty ? "No matching chests found." : "Found \(results.count) matching chest\(results.count == 1 ? "" : "s")."
+                    self.lootSearchCurrentLabel?.stringValue = "Done."
+                    self.renderLootSearchGroups(header)
+                }
+            } catch is CancellationError {
+            } catch {
+                await MainActor.run { [weak self] in self?.renderLootSearchText("Loot search failed: \(error)") }
+            }
+        }
+    }
+
+    private func renderLootSearchText(_ text: String) {
+        lootSearchText?.string = text
+    }
+
+    private func applyLootSearch(_ progress: LootSearchProgress) {
+        lootSearchResults.append(contentsOf: progress.matches)
+        if let structure = progress.currentStructure, !progress.matches.isEmpty {
+            lootSearchGroups.append((structure, progress.matches))
+        }
+        lootSearchProgress?.maxValue = Double(max(1, progress.totalStructures))
+        lootSearchProgress?.doubleValue = Double(progress.structuresScanned)
+        if let structure = progress.currentStructure {
+            lootSearchCurrentLabel?.stringValue = "Generating: \(structure.structureID) at (\(structure.x), \(structure.z)) — \(progress.structuresScanned)/\(progress.totalStructures)"
+        }
+        renderLootSearchGroups("Found \(lootSearchResults.count) matching chest\(lootSearchResults.count == 1 ? "" : "s") so far.")
+    }
+
+    private func renderLootSearchGroups(_ message: String) {
+        let groups = lootSearchGroups.map { group in
+            "\(group.structure.structureID) at (\(group.structure.x), \(group.structure.z)) — \(group.containers.count) matching chest\(group.containers.count == 1 ? "" : "s")\n" + group.containers.map { container in
+                "  \(container.block) at (\(container.x), \(container.y), \(container.z))\n" + container.items.map { "    • \($0)" }.joined(separator: "\n")
+            }.joined(separator: "\n")
+        }.joined(separator: "\n\n")
+        renderLootSearchText(groups.isEmpty ? message : "\(message)\n\n\(groups)")
+    }
+
     func controlTextDidChange(_ notification: Notification) {
         guard let field = notification.object as? NSTextField, field === lootFilterInput else { return }
         renderLootText()
@@ -635,15 +773,33 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         loadDatapack(threadCount: count)
     }
 
+    @objc private func minecraftVersionChanged() {
+        guard let version = minecraftVersionInput?.titleOfSelectedItem,
+              let datapack = vanillaDatapacks.first(where: { $0.version == version }),
+              datapack != selectedDatapack
+        else { return }
+        selectedDatapack = datapack
+        loadDatapack(threadCount: threadCount)
+    }
+
     private func loadDatapack(threadCount: Int) {
+        let datapack = selectedDatapack
         generation += 1
         renderTask?.cancel()
+        renderTimer?.invalidate()
+        renderTimer = nil
         scheduler = nil
-        commonBase.render(status: "Loading datapack for \(threadCount) generation thread\(threadCount == 1 ? "" : "s")…")
+        mapView.tiles.removeAll(keepingCapacity: true)
+        mapView.tileImages.removeAll(keepingCapacity: true)
+        mapView.lootContainers.removeAll(keepingCapacity: true)
+        completedTiles = 0
+        pendingTiles = 0
+        awaitingFirstTileForSeed = currentSeed != nil
+        commonBase.render(status: "Loading Minecraft \(datapack.version) datapack for \(threadCount) generation thread\(threadCount == 1 ? "" : "s")…")
         biomeGenerationStatusLabel?.stringValue = "Biomes: preparing generator."
         structureGenerationStatusLabel?.stringValue = "Structures: waiting for generator."
         do {
-            dataPackRoot = try Self.findDatapackRoot()
+            dataPackRoot = try Self.findDatapackRoot(for: datapack)
         } catch {
             commonBase.render(status: "Could not locate the Minecraft datapack: \(error)", isError: true)
             return
@@ -652,20 +808,22 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         Task { [weak self] in
             guard let self else { return }
             do {
+                guard self.threadCount == threadCount, self.selectedDatapack == datapack else { return }
                 self.commonBase.render(status: "Preparing world generator…")
                 let next = NativeGenerationPlatform(threadCount: threadCount)
-                try await next.initialize(rootURL: root)
+                try await next.initialize(rootURL: root, packFormat: datapack.packFormat)
                 let registry = await next.registryIDs()
-                guard self.threadCount == threadCount else { return }
+                guard self.threadCount == threadCount, self.selectedDatapack == datapack else { return }
                 self.scheduler = next
                 self.populateBiomeList(registry.biomes)
                 self.populateDimensionPicker(registry.dimensions)
                 self.populateStructureList(registry.structures)
-                self.commonBase.render(status: "Datapack ready. Enter a seed and click Render.")
+                self.commonBase.render(status: "Minecraft \(datapack.version) datapack ready. Enter a seed and click Render.")
                 self.biomeGenerationStatusLabel?.stringValue = "Biomes: ready to render."
                 self.structureGenerationStatusLabel?.stringValue = "Structures: ready to render."
-                if self.currentSeed != nil { self.scheduleRender(immediately: true) }
+                if self.currentSeed != nil { self.renderVisibleRegion() }
             } catch {
+                guard self.threadCount == threadCount, self.selectedDatapack == datapack else { return }
                 self.commonBase.render(status: "Failed to initialize DPReader: \(error)", isError: true)
             }
         }
@@ -804,24 +962,24 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         debugLabel?.stringValue = lines.joined(separator: "\n")
     }
 
-    private static func findDatapackRoot() throws -> URL {
+    private static func findDatapackRoot(for datapack: VanillaDatapack) throws -> URL {
         var candidates: [URL] = []
         if let override = ProcessInfo.processInfo.environment["DAPPERMAP_DATAPACK"] {
-            candidates.append(URL(fileURLWithPath: override, isDirectory: true))
+            candidates.append(URL(fileURLWithPath: override.replacingOccurrences(of: "{version}", with: datapack.version), isDirectory: true))
         }
         if let resources = Bundle.main.resourceURL {
-            candidates.append(resources.appendingPathComponent("Data/1.21.11", isDirectory: true))
-            candidates.append(resources.appendingPathComponent("1.21.11", isDirectory: true))
+            candidates.append(resources.appendingPathComponent(datapack.nativeDataDirectory, isDirectory: true))
+            candidates.append(resources.appendingPathComponent(datapack.version, isDirectory: true))
         }
         candidates.append(
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-                .appendingPathComponent("Data/1.21.11", isDirectory: true)
+                .appendingPathComponent(datapack.nativeDataDirectory, isDirectory: true)
         )
         candidates.append(
             URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
-                .appendingPathComponent("Data/1.21.11", isDirectory: true)
+                .appendingPathComponent(datapack.nativeDataDirectory, isDirectory: true)
         )
         for candidate in candidates {
             let biomeDirectory = candidate.appendingPathComponent("data/minecraft/worldgen/biome", isDirectory: true)
@@ -831,7 +989,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             }
         }
         throw NativeAppError.message(
-            "Set DAPPERMAP_DATAPACK to the 1.21.11 datapack directory, or run from the repository root."
+            "Extract Minecraft \(datapack.version) to \(datapack.nativeDataDirectory), set DAPPERMAP_DATAPACK, or run from the repository root. DAPPERMAP_DATAPACK may contain {version}."
         )
     }
 }
@@ -864,6 +1022,18 @@ final class NativeAppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit DapperMap", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
+        let editItem = NSMenuItem()
+        editItem.title = "Edit"
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: #selector(UndoManager.undo), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: #selector(UndoManager.redo), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
         NSApplication.shared.mainMenu = mainMenu
     }
 }

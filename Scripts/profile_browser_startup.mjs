@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
 import { WASI } from "node:wasi";
 
 import { SwiftRuntime } from "../.build/checkouts/JavaScriptKit/Plugins/PackageToJS/Templates/runtime.mjs";
@@ -84,7 +85,7 @@ class MockElement {
         this._innerText = value;
         if (this.id === "status") {
             record(`status:${value}`);
-            if (value === "Datapack ready. Enter a seed and click Render.") {
+            if (value.endsWith("datapack ready. Enter a seed and click Render.")) {
                 readyResolve?.();
             }
             if (value.startsWith("Rendered seed ") || value.startsWith("Render failed:")) {
@@ -124,9 +125,15 @@ class MockCanvas extends MockElement {
 
 const elementIDs = [
     "map-viewport",
+    "page-select",
+    "minecraft-version-input",
     "seed-input",
+    "dimension-input",
+    "y-input",
     "render-button",
     "status",
+    "biome-generation-status",
+    "structure-generation-status",
     "biome-reset-button",
     "biome-import-button",
     "biome-export-button",
@@ -135,11 +142,28 @@ const elementIDs = [
     "biome-summary",
     "biome-empty",
     "biome-list",
+    "structure-reset-button",
+    "structure-summary",
+    "structure-empty",
+    "structure-list",
+    "loot-info",
+    "loot-filter-input",
+    "loot-message",
+    "loot-list",
     "debug-last-tile",
+    "debug-density-compilation",
     "debug-generation-time",
     "debug-render-time",
     "debug-pending-tiles",
     "debug-cached-tiles",
+    "debug-structure-time",
+    "debug-structure-sampling",
+    "debug-structure-validation",
+    "debug-structure-candidates",
+    "debug-structure-accepted",
+    "debug-structure-rejected",
+    "debug-structure-cache-hits",
+    "debug-structure-types",
     "map-tooltip",
     "map-canvas",
     "map-overlay",
@@ -185,7 +209,10 @@ globalThis.fetch = async function fetchLocal(resource) {
     const spec = typeof resource === "string" ? resource : String(resource);
     const resolvedPath = path.resolve(rootDir, spec);
     record("fetch:start", { spec });
-    const text = await fs.readFile(resolvedPath, "utf8");
+    const bytes = await fs.readFile(resolvedPath);
+    const text = spec.endsWith("-datapack.bundle.json.gz")
+        ? gunzipSync(bytes).toString("utf8")
+        : bytes.toString("utf8");
     record("fetch:end", { spec, bytes: Buffer.byteLength(text, "utf8") });
     return {
         async text() {
