@@ -22,7 +22,7 @@ Build scripts are provided in the `Scripts` directory.
 * `Scripts/run_appkit.sh` will build and run the AppKit-based target.
 * `Scripts/run_sdl.sh` will build and run the SDL-based target.
 
-For the two native targets, you can specify `DAPPERMAP_ENABLE_LLVM=1`, which will enable compiling density functions down to bytecode via LLVM. This is currently disabled by default as the functions take a while to compile and the benefits are (relatively) marginal.
+The Debug tab's Advanced Settings controls native generation/search thread counts and LLVM density compilation. Native loot searches use dedicated workers, leaving map-generation workers responsive.
 
 ## Disclaimer
 

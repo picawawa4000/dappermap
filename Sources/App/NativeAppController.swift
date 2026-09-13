@@ -61,6 +61,8 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
     private var dataPackRoot: URL?
     private var selectedDatapack = defaultVanillaDatapack
     private var threadCount: Int
+    private var lootSearchThreadCount = 1
+    private var enableDensityCompilation = ProcessInfo.processInfo.environment["DAPPERMAP_ENABLE_LLVM"] == "1"
     private var generation = 0
     private var renderTask: Task<Void, Never>?
     private var renderTimer: Timer?
@@ -89,6 +91,16 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             label: "Generation Threads",
             value: "\(threadCount)",
             kind: .integer(defaultValue: threadCount, range: 1...32)
+        ), SidebarField(
+            id: "loot-search-threads",
+            label: "Loot Search Threads",
+            value: "\(lootSearchThreadCount)",
+            kind: .integer(defaultValue: lootSearchThreadCount, range: 1...4)
+        ), SidebarField(
+            id: "llvm",
+            label: "LLVM Density Compilation",
+            value: enableDensityCompilation ? "On" : "Off",
+            kind: .text
         )])
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -400,8 +412,30 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             scroll.heightAnchor.constraint(equalToConstant: 360).isActive = true
             stack.addArrangedSubview(scroll)
             lootSearchText = text
+        case "about":
+            let scroll = NSScrollView()
+            scroll.hasVerticalScroller = true
+            scroll.borderType = .bezelBorder
+            let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 324, height: 560))
+            text.isEditable = false
+            text.isSelectable = true
+            text.isAutomaticLinkDetectionEnabled = true
+            text.drawsBackground = false
+            text.isVerticallyResizable = true
+            text.isHorizontallyResizable = false
+            text.autoresizingMask = [.width]
+            text.textContainer?.widthTracksTextView = true
+            text.textContainer?.containerSize = NSSize(width: 324, height: CGFloat.greatestFiniteMagnitude)
+            text.maxSize = NSSize(width: 324, height: CGFloat.greatestFiniteMagnitude)
+            text.font = NSFont.systemFont(ofSize: 13)
+            text.string = Self.aboutText
+            scroll.documentView = text
+            scroll.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            scroll.heightAnchor.constraint(equalToConstant: 560).isActive = true
+            stack.addArrangedSubview(scroll)
         case "debug":
-            for field in tab.fields where field.id == "threads" {
+            stack.addArrangedSubview(label("Advanced Settings", size: 16, bold: true))
+            for field in tab.fields where field.id == "threads" || field.id == "loot-search-threads" {
                 stack.addArrangedSubview(label(field.label, size: 12, bold: true))
                 let row = NSStackView()
                 row.orientation = .horizontal
@@ -416,14 +450,20 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
                     stepper.maxValue = Double(range.upperBound)
                     stepper.integerValue = defaultValue
                 }
+                stepper.identifier = NSUserInterfaceItemIdentifier(field.id)
                 stepper.target = self
-                stepper.action = #selector(threadCountChanged)
+                stepper.action = #selector(advancedThreadCountChanged(_:))
                 row.addArrangedSubview(value)
                 row.addArrangedSubview(stepper)
                 stack.addArrangedSubview(row)
-                threadField = value
-                threadStepper = stepper
+                if field.id == "threads" {
+                    threadField = value
+                    threadStepper = stepper
+                }
             }
+            let llvm = NSButton(checkboxWithTitle: "LLVM Density Compilation", target: self, action: #selector(llvmCompilationChanged(_:)))
+            llvm.state = enableDensityCompilation ? .on : .off
+            stack.addArrangedSubview(llvm)
             let metrics = wrappingLabel("Waiting for a render")
             metrics.font = NSFont(name: "Menlo", size: 11) ?? .monospacedSystemFont(ofSize: 11, weight: .regular)
             metrics.widthAnchor.constraint(equalToConstant: 324).isActive = true
@@ -440,6 +480,61 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         let base = NSFont(name: "Georgia", size: size) ?? .systemFont(ofSize: size)
         field.font = bold ? NSFontManager.shared.convert(base, toHaveTrait: .boldFontMask) : base
         return field
+    }
+
+    private static let aboutText = """
+    About DapperMap
+
+    In sum, DapperMap is yet another Minecraft seed mapper. However, it has some important features that differentiate it from other present seed mappers:
+
+    • It is fully free and open-source: you can see all of the source code at https://github.com/picawawa4000/dappermap.
+    • It has full support for datapacks (in fact, the underlying library, DPReader (https://github.com/picawawa4000/dpreader-swift), only works when fed Minecraft's default datapack). (As of writing this, uploading datapacks is not supported, but it would be a triviality to implement.)
+    • It is available both as a webapp (via SwiftWASM and JavaScriptKit) and as a native app for macOS (via AppKit). (There is technically cross-platform support via SDL, but it doesn't look very nice right now, so do not consider it done yet.) The native app is much faster than the webapp; give it a try if you can.
+    • It supports viewing structure loot: you can click on a structure and the map will display all of its chests, along with their loot. Additionally, searching for loot is supported: you can input a location, radius, and item, and the app will find all instances of that item in that radius.
+
+    Limitations
+
+    DapperMap is currently in beta. As such, while it is usually quite accurate, it can be wrong sometimes. The following is a list of known issues:
+
+    • The following structures are sometimes not positioned correctly: jungle temples, desert pyramids.
+    • The following structures display the wrong loot for some blocks: ocean ruins, end cities, ruined portals in the Nether.
+    • The following structures display the correct loot and chest position, except that chests show up at the bottom of the world: ruined portals.
+    • Explorer maps can crash loot resolution.
+
+    If you ever run into any other issues using DapperMap, report them in the GitHub issue tracker. Include the exact seed, version, conditions, and coordinates/structure (where applicable) that caused the issue.
+
+    Disclaimer
+
+    This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+    This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details. You may find a copy at https://github.com/picawawa4000/dappermap/blob/main/LICENCE.txt.
+
+    NOT AN OFFICIAL MINECRAFT PRODUCT. NOT AFFILIATED WITH OR ENDORSED BY MOJANG AB OR MICROSOFT.
+    """
+
+    @objc fileprivate func showAboutPopup() {
+        let alert = NSAlert()
+        alert.messageText = "About DapperMap"
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 560, height: 360))
+        scroll.hasVerticalScroller = true
+        let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 540, height: 700))
+        text.isEditable = false
+        text.isSelectable = true
+        text.isAutomaticLinkDetectionEnabled = true
+        text.string = Self.aboutText
+        text.textContainer?.widthTracksTextView = true
+        text.isHorizontallyResizable = false
+        scroll.documentView = text
+        alert.accessoryView = scroll
+        alert.addButton(withTitle: "Source")
+        alert.addButton(withTitle: "DPReader")
+        alert.addButton(withTitle: "License")
+        alert.addButton(withTitle: "Close")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: NSWorkspace.shared.open(URL(string: "https://github.com/picawawa4000/dappermap")!)
+        case .alertSecondButtonReturn: NSWorkspace.shared.open(URL(string: "https://github.com/picawawa4000/dpreader-swift")!)
+        case .alertThirdButtonReturn: NSWorkspace.shared.open(URL(string: "https://github.com/picawawa4000/dappermap/blob/main/LICENCE.txt")!)
+        default: break
+        }
     }
 
     private func wrappingLabel(_ text: String) -> NSTextField {
@@ -764,13 +859,24 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         scheduleRender(immediately: true)
     }
 
-    @objc private func threadCountChanged() {
-        guard let stepper = threadStepper else { return }
-        let count = stepper.integerValue
-        threadField?.stringValue = "\(count)"
-        guard count != threadCount else { return }
-        threadCount = count
-        loadDatapack(threadCount: count)
+    @objc private func advancedThreadCountChanged(_ sender: NSStepper) {
+        let count = sender.integerValue
+        if sender.identifier?.rawValue == "loot-search-threads" {
+            guard count != lootSearchThreadCount else { return }
+            lootSearchThreadCount = count
+        } else {
+            threadField?.stringValue = "\(count)"
+            guard count != threadCount else { return }
+            threadCount = count
+        }
+        loadDatapack(threadCount: threadCount)
+    }
+
+    @objc private func llvmCompilationChanged(_ sender: NSButton) {
+        let enabled = sender.state == .on
+        guard enabled != enableDensityCompilation else { return }
+        enableDensityCompilation = enabled
+        loadDatapack(threadCount: threadCount)
     }
 
     @objc private func minecraftVersionChanged() {
@@ -784,6 +890,8 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
 
     private func loadDatapack(threadCount: Int) {
         let datapack = selectedDatapack
+        let searchThreadCount = lootSearchThreadCount
+        let useLLVM = enableDensityCompilation
         generation += 1
         renderTask?.cancel()
         renderTimer?.invalidate()
@@ -808,12 +916,18 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         Task { [weak self] in
             guard let self else { return }
             do {
-                guard self.threadCount == threadCount, self.selectedDatapack == datapack else { return }
+                guard self.threadCount == threadCount, self.lootSearchThreadCount == searchThreadCount,
+                      self.enableDensityCompilation == useLLVM, self.selectedDatapack == datapack else { return }
                 self.commonBase.render(status: "Preparing world generator…")
-                let next = NativeGenerationPlatform(threadCount: threadCount)
+                let next = NativeGenerationPlatform(
+                    threadCount: threadCount,
+                    lootSearchThreadCount: searchThreadCount,
+                    enableDensityCompilation: useLLVM
+                )
                 try await next.initialize(rootURL: root, packFormat: datapack.packFormat)
                 let registry = await next.registryIDs()
-                guard self.threadCount == threadCount, self.selectedDatapack == datapack else { return }
+                guard self.threadCount == threadCount, self.lootSearchThreadCount == searchThreadCount,
+                      self.enableDensityCompilation == useLLVM, self.selectedDatapack == datapack else { return }
                 self.scheduler = next
                 self.populateBiomeList(registry.biomes)
                 self.populateDimensionPicker(registry.dimensions)
@@ -1003,9 +1117,9 @@ final class NativeAppDelegate: NSObject, NSApplicationDelegate {
     private var controller: NativeAppController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        installApplicationMenu()
         let controller = NativeAppController()
         self.controller = controller
+        installApplicationMenu()
         controller.start()
     }
 
@@ -1018,7 +1132,8 @@ final class NativeAppDelegate: NSObject, NSApplicationDelegate {
         let appItem = NSMenuItem()
         mainMenu.addItem(appItem)
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About DapperMap", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        let aboutItem = appMenu.addItem(withTitle: "About DapperMap", action: #selector(NativeAppController.showAboutPopup), keyEquivalent: "")
+        aboutItem.target = controller
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Quit DapperMap", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu

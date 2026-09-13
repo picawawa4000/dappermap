@@ -474,6 +474,13 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             onProgress(LootSearchProgress(
                 structuresScanned: index, totalStructures: structures.count, currentStructure: presentation
             ))
+#if os(WASI)
+            // The browser has one generation executor. Yield before each expensive structure so
+            // queued map tiles and marker-click loot work can run instead of waiting for a full
+            // radius search to complete.
+            await Task.yield()
+            try Task.checkCancellation()
+#endif
             let newMatches: [MapLootPresentation] = try loot(for: structure, seed: worldSeed).compactMap { container -> MapLootPresentation? in
                 guard container.loot.contains(where: { LootSearchMatcher.matches(item: $0, query: itemQuery) }) else {
                     return nil
@@ -488,6 +495,9 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 structuresScanned: index + 1, totalStructures: structures.count,
                 currentStructure: presentation, matches: newMatches
             ))
+#if os(WASI)
+            await Task.yield()
+#endif
         }
         return matches.sorted { ($0.z, $0.x, $0.y, $0.block) < ($1.z, $1.x, $1.y, $1.block) }
     }

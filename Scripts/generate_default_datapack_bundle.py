@@ -30,7 +30,9 @@ PACK_METADATA = {
 INCLUDE_GLOBS = [
     "data/minecraft/worldgen/biome/*.json",
     "data/minecraft/worldgen/density_function/**/*.json",
-    "data/minecraft/worldgen/noise/*.json",
+    # Newer vanilla packs place Nether climate noises under `noise/nether/`; use a recursive
+    # glob so the browser bundle has the same registry entries as AppKit's full datapack tree.
+    "data/minecraft/worldgen/noise/**/*.json",
     "data/minecraft/worldgen/noise_settings/**/*.json",
     "data/minecraft/worldgen/structure/*.json",
     "data/minecraft/worldgen/structure_set/*.json",

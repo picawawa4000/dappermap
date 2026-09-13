@@ -17,8 +17,13 @@ import WASILibc
 #if !os(WASI)
 public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     private let workers: [TileGenerationService]
+    /// Search workers never service interactive tile or marker-loot requests. This keeps a
+    /// potentially long radius search from consuming the map's responsive generation capacity.
+    private let lootSearchWorkers: [TileGenerationService]
     private var availableWorkers: [Int]
     private var waiters: [CheckedContinuation<Int, Never>] = []
+    private var availableLootSearchWorkers: [Int]
+    private var lootSearchWaiters: [CheckedContinuation<Int, Never>] = []
     private var initializedDatapack: (rootURL: URL, packFormat: Version)?
     private var initializingDatapack: (rootURL: URL, packFormat: Version)?
     private var initializationTask: Task<Void, Error>?
@@ -26,9 +31,11 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
 
     public init(
         threadCount: Int,
-        enableDensityCompilation: Bool = ProcessInfo.processInfo.environment["DAPPERMAP_ENABLE_LLVM"] == "1"
+        lootSearchThreadCount: Int = 1,
+        enableDensityCompilation: Bool = false
     ) {
         let count = max(1, min(32, threadCount))
+        let searchCount = max(1, min(4, lootSearchThreadCount))
         workers = (0..<count).map { index in
             // DPReader's LLVM biome JIT takes roughly 14 seconds per shape and is intended for
             // long batch jobs. Interactive AppKit/SDL views rarely amortize that setup cost.
@@ -37,9 +44,13 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
                 prefersNativeCompilation: enableDensityCompilation && index == 0
             )
         }
+        lootSearchWorkers = (0..<searchCount).map { _ in
+            TileGenerationService(samplingBackend: .scalar, prefersNativeCompilation: false)
+        }
         // `popLast()` should hand the first request to worker zero, the worker configured with
         // LLVM bulk sampling, rather than to the highest-index scalar fallback.
         availableWorkers = Array((0..<count).reversed())
+        availableLootSearchWorkers = Array((0..<searchCount).reversed())
     }
 
     public func initialize(rootURL: URL, packFormat: Version) async throws {
@@ -58,7 +69,7 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
                initializedDatapack?.packFormat == datapack.packFormat { return }
         }
 
-        let workers = self.workers
+        let workers = self.workers + self.lootSearchWorkers
         let loadingRoot = try stageRootIfNeeded(rootURL: standardizedRootURL, packFormat: packFormat)
         let task = Task {
             try await withThrowingTaskGroup(of: Void.self) { group in
@@ -209,13 +220,13 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
         seed: Int64,
         onProgress: @escaping @Sendable (LootSearchProgress) -> Void
     ) async throws -> [MapLootPresentation] {
-        let workerIndex = await acquireWorker()
+        let workerIndex = await acquireLootSearchWorker()
         do {
-            let result = try await workers[workerIndex].searchLoot(query, seed: seed, onProgress: onProgress)
-            releaseWorker(workerIndex)
+            let result = try await lootSearchWorkers[workerIndex].searchLoot(query, seed: seed, onProgress: onProgress)
+            releaseLootSearchWorker(workerIndex)
             return result
         } catch {
-            releaseWorker(workerIndex)
+            releaseLootSearchWorker(workerIndex)
             throw error
         }
     }
@@ -234,6 +245,19 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
             availableWorkers.append(worker)
         } else {
             waiters.removeFirst().resume(returning: worker)
+        }
+    }
+
+    private func acquireLootSearchWorker() async -> Int {
+        if let worker = availableLootSearchWorkers.popLast() { return worker }
+        return await withCheckedContinuation { lootSearchWaiters.append($0) }
+    }
+
+    private func releaseLootSearchWorker(_ worker: Int) {
+        if lootSearchWaiters.isEmpty {
+            availableLootSearchWorkers.append(worker)
+        } else {
+            lootSearchWaiters.removeFirst().resume(returning: worker)
         }
     }
 }

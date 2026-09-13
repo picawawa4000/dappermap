@@ -2594,8 +2594,12 @@ public func startBrowserApp() {
                 timeout: .milliseconds(250),
                 checkInterval: .milliseconds(1)
             )
-            let samplingBackend = await MainActor.run {
-                webKitNeedsScalarTileSampling() ? TileSamplingBackend.scalar : .nestedWASM
+            let samplingBackend: TileSamplingBackend = await MainActor.run {
+                switch JSObject.global["__dappermapWASMCompilationPreference"].string {
+                case "on": .nestedWASM
+                case "off": .scalar
+                default: .scalar
+                }
             }
             let tileGenerator = TileGenerationService(
                 serialExecutor: .dedicated(tileExecutor),

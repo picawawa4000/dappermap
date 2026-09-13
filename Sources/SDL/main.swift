@@ -34,6 +34,8 @@ private final class SDLMapApplication {
     // Match the AppKit frontend: each worker owns a datapack, so starting one per CPU can use a
     // prohibitive amount of memory before the first tile is produced.
     private var threadCount = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
+    private var lootSearchThreadCount = 1
+    private var enableDensityCompilation = ProcessInfo.processInfo.environment["DAPPERMAP_ENABLE_LLVM"] == "1"
     private var tile: MapTilePresentation?
     private var tiles: [SDLTileKey: MapTilePresentation] = [:]
     private var tileTextures: [SDLTileKey: OpaquePointer] = [:]
@@ -62,9 +64,13 @@ private final class SDLMapApplication {
     private var resizeDeadline: UInt32?
     private var generationPlatform: NativeGenerationPlatform?
     private var generationPlatformThreadCount = 0
+    private var generationPlatformLootSearchThreadCount = 0
+    private var generationPlatformUsesLLVM = false
     private var generationPlatformRoot: URL?
     private var generationPlatformPackFormat: Version?
     private var selectedDatapack = defaultVanillaDatapack
+    private var aboutScrollLine = 0
+    private var showingAboutPopup = false
 
     func run() {
         guard let window = SDL_CreateWindow(
@@ -86,7 +92,9 @@ private final class SDLMapApplication {
         defer { tileTextures.values.forEach(SDL_DestroyTexture) }
 
         sidebar = DapperMapBase.sidebar(extraDebugFields: [
-            SidebarField(id: "threads", label: "Threads", value: "\(threadCount)", kind: .integer(defaultValue: threadCount, range: 1...32))
+            SidebarField(id: "threads", label: "Generation Threads", value: "\(threadCount)", kind: .integer(defaultValue: threadCount, range: 1...32)),
+            SidebarField(id: "loot-search-threads", label: "Loot Search Threads", value: "\(lootSearchThreadCount)", kind: .integer(defaultValue: lootSearchThreadCount, range: 1...4)),
+            SidebarField(id: "llvm", label: "LLVM Density Compilation", value: enableDensityCompilation ? "On" : "Off", kind: .text)
         ])
         var running = true
         while running {
@@ -105,6 +113,13 @@ private final class SDLMapApplication {
                     if hasRendered { resizeDeadline = SDL_GetTicks() &+ 150 }
                 case SDL_KEYDOWN.rawValue:
                     let key = event.key.keysym.sym
+                    if showingAboutPopup {
+                        if key == SDLK_1.rawValue { _ = SDL_OpenURL("https://github.com/picawawa4000/dappermap") }
+                        if key == SDLK_2.rawValue { _ = SDL_OpenURL("https://github.com/picawawa4000/dpreader-swift") }
+                        if key == SDLK_3.rawValue { _ = SDL_OpenURL("https://github.com/picawawa4000/dappermap/blob/main/LICENCE.txt") }
+                        if key == SDLK_ESCAPE.rawValue || key == SDLK_RETURN.rawValue { showingAboutPopup = false }
+                        break
+                    }
                     let modifiers = event.key.keysym.mod
                     let clipboardModifier = modifiers & UInt16(KMOD_CTRL.rawValue | KMOD_GUI.rawValue) != 0
                     if clipboardModifier, key == SDLK_c.rawValue {
@@ -132,12 +147,21 @@ private final class SDLMapApplication {
                         break
                     }
                     if key == SDLK_ESCAPE.rawValue || key == SDLK_q.rawValue { running = false }
+                    if key == SDLK_a.rawValue { showingAboutPopup = true }
                     if key == SDLK_LEFTBRACKET.rawValue { threadCount = max(1, threadCount - 1); requestRegenerate() }
                     if key == SDLK_RIGHTBRACKET.rawValue { threadCount = min(32, threadCount + 1); requestRegenerate() }
+                    if selectedTabID == "debug", key == SDLK_COMMA.rawValue { lootSearchThreadCount = max(1, lootSearchThreadCount - 1); requestRegenerate() }
+                    if selectedTabID == "debug", key == SDLK_PERIOD.rawValue { lootSearchThreadCount = min(4, lootSearchThreadCount + 1); requestRegenerate() }
+                    if selectedTabID == "debug", key == SDLK_l.rawValue { enableDensityCompilation.toggle(); requestRegenerate() }
                     if key == SDLK_z.rawValue { changeDatapackVersion(by: -1) }
                     if key == SDLK_x.rawValue { changeDatapackVersion(by: 1) }
-                    if key == SDLK_PAGEUP.rawValue { sampleY = min(316, sampleY + 4); requestRegenerate() }
-                    if key == SDLK_PAGEDOWN.rawValue { sampleY = max(-64, sampleY - 4); requestRegenerate() }
+                    if selectedTabID == "about", key == SDLK_PAGEUP.rawValue { aboutScrollLine = max(0, aboutScrollLine - 14) }
+                    else if selectedTabID == "about", key == SDLK_PAGEDOWN.rawValue { aboutScrollLine = min(max(0, Self.aboutLines.count - 14), aboutScrollLine + 14) }
+                    else if key == SDLK_PAGEUP.rawValue { sampleY = min(316, sampleY + 4); requestRegenerate() }
+                    else if key == SDLK_PAGEDOWN.rawValue { sampleY = max(-64, sampleY - 4); requestRegenerate() }
+                    if selectedTabID == "about", key == SDLK_g.rawValue { _ = SDL_OpenURL("https://github.com/picawawa4000/dappermap") }
+                    if selectedTabID == "about", key == SDLK_d.rawValue { _ = SDL_OpenURL("https://github.com/picawawa4000/dpreader-swift") }
+                    if selectedTabID == "about", key == SDLK_l.rawValue { _ = SDL_OpenURL("https://github.com/picawawa4000/dappermap/blob/main/LICENCE.txt") }
                     if key == SDLK_r.rawValue { requestRegenerate() }
                 case SDL_MOUSEBUTTONDOWN.rawValue:
                     guard event.button.button == 1, event.button.x < Int32(mapWidth) else { break }
@@ -249,13 +273,21 @@ private final class SDLMapApplication {
         let platform: NativeGenerationPlatform
         if let cached = generationPlatform,
            generationPlatformThreadCount == workers,
+           generationPlatformLootSearchThreadCount == lootSearchThreadCount,
+           generationPlatformUsesLLVM == enableDensityCompilation,
            generationPlatformRoot == root,
            generationPlatformPackFormat == datapack.packFormat {
             platform = cached
         } else {
-            platform = NativeGenerationPlatform(threadCount: workers)
+            platform = NativeGenerationPlatform(
+                threadCount: workers,
+                lootSearchThreadCount: lootSearchThreadCount,
+                enableDensityCompilation: enableDensityCompilation
+            )
             generationPlatform = platform
             generationPlatformThreadCount = workers
+            generationPlatformLootSearchThreadCount = lootSearchThreadCount
+            generationPlatformUsesLLVM = enableDensityCompilation
             generationPlatformRoot = root
             generationPlatformPackFormat = datapack.packFormat
         }
@@ -383,6 +415,7 @@ private final class SDLMapApplication {
         SDL_RenderFillRect(renderer, &panel)
         drawText(renderer, text: "DAPPERMAP SDL", x: mapWidth + 18, y: 22, scale: 3)
         drawSidebar(renderer)
+        if showingAboutPopup { drawAboutPopup(renderer) }
         drawText(renderer, text: "DRAG MAP TO PAN", x: mapWidth + 18, y: mapHeight - 70, scale: 2)
         drawText(renderer, text: "R RENDER [] THREADS Z/X VERSION CTRL V/C SEED", x: mapWidth + 18, y: mapHeight - 36, scale: 1)
         SDL_RenderPresent(renderer)
@@ -421,18 +454,21 @@ private final class SDLMapApplication {
             drawText(renderer, text: structureGenerationStatus, x: mapWidth + 18, y: y + 180, scale: 1)
             drawText(renderer, text: "X \(Int(centerX)) Z \(Int(centerZ)) BPP \(blocksPerPixel)", x: mapWidth + 18, y: y + 202, scale: 1)
         } else if tab.id == "debug" {
+            drawText(renderer, text: "ADVANCED SETTINGS", x: mapWidth + 18, y: y, scale: 1)
+            drawText(renderer, text: "GEN THREADS \(threadCount)  [ / ]", x: mapWidth + 18, y: y + 18, scale: 1)
+            drawText(renderer, text: "SEARCH THREADS \(lootSearchThreadCount)  , / .", x: mapWidth + 18, y: y + 34, scale: 1)
+            drawText(renderer, text: "LLVM \(enableDensityCompilation ? "ON" : "OFF")  L", x: mapWidth + 18, y: y + 50, scale: 1)
             let last = tile.map { "\($0.tileX), \($0.tileZ)" } ?? "WAITING"
-            drawText(renderer, text: "LAST TILE \(last)", x: mapWidth + 18, y: y, scale: 1)
-            drawText(renderer, text: "GEN \(formatDuration(tile?.generationMilliseconds ?? 0))", x: mapWidth + 18, y: y + 22, scale: 1)
+            drawText(renderer, text: "LAST TILE \(last)", x: mapWidth + 18, y: y + 76, scale: 1)
+            drawText(renderer, text: "GEN \(formatDuration(tile?.generationMilliseconds ?? 0))", x: mapWidth + 18, y: y + 98, scale: 1)
             if let milliseconds = tile?.densityCompilationMilliseconds,
                let backend = tile?.densityCompilationBackend {
-                drawText(renderer, text: "DENSITY \(backend) \(formatDuration(milliseconds))", x: mapWidth + 18, y: y + 44, scale: 1)
+                drawText(renderer, text: "DENSITY \(backend) \(formatDuration(milliseconds))", x: mapWidth + 18, y: y + 120, scale: 1)
             } else {
-                drawText(renderer, text: "DENSITY NOT COMPILED", x: mapWidth + 18, y: y + 44, scale: 1)
+                drawText(renderer, text: "DENSITY NOT COMPILED", x: mapWidth + 18, y: y + 120, scale: 1)
             }
-            drawText(renderer, text: "CACHED \(tiles.count)", x: mapWidth + 18, y: y + 66, scale: 1)
-            drawText(renderer, text: "PENDING \(pendingTileCount)", x: mapWidth + 18, y: y + 88, scale: 1)
-            drawText(renderer, text: "THREADS \(threadCount)", x: mapWidth + 18, y: y + 110, scale: 1)
+            drawText(renderer, text: "CACHED \(tiles.count)", x: mapWidth + 18, y: y + 142, scale: 1)
+            drawText(renderer, text: "PENDING \(pendingTileCount)", x: mapWidth + 18, y: y + 164, scale: 1)
         } else if tab.id == "biomes" {
             drawColorRows(renderer, ids: loadedBiomeIDs, colors: biomeColors, y: y, fallback: resolvedBiomeColor(for:))
             drawRGBPicker(renderer, ids: loadedBiomeIDs, isStructure: false)
@@ -448,7 +484,40 @@ private final class SDLMapApplication {
                     drawText(renderer, text: "X \(container.x) Z \(container.z)", x: mapWidth + 18, y: y + index * 34 + 14, scale: 1)
                 }
             }
+        } else if tab.id == "about" {
+            drawText(renderer, text: "PGUP/PGDN SCROLL  G SOURCE  D DPReader  L LICENSE", x: mapWidth + 18, y: y, scale: 1)
+            for (index, line) in Self.aboutLines.dropFirst(aboutScrollLine).prefix(14).enumerated() {
+                drawText(renderer, text: line, x: mapWidth + 18, y: y + 18 + index * 18, scale: 1)
+            }
         }
+    }
+
+    private static let aboutLines = [
+        "ABOUT DAPPERMAP", "", "In sum, DapperMap is yet another Minecraft seed mapper.",
+        "However, it has important features that differentiate it:", "",
+        "* Fully free and open-source. G opens the source code.",
+        "* Full datapack support through DPReader. D opens DPReader.",
+        "* Web (SwiftWASM/JavaScriptKit), macOS (AppKit), and SDL.",
+        "  The native app is much faster than the webapp.",
+        "* View structure loot and search for loot by location, radius,", "  and item.", "",
+        "LIMITATIONS", "", "DapperMap is currently in beta and can sometimes be wrong.",
+        "* Jungle temples and desert pyramids can be positioned wrong.",
+        "* Ocean ruins, end cities, and Nether ruined portals can show", "  wrong loot for some blocks.",
+        "* Ruined portal chests can show at the bottom of the world.",
+        "* Explorer maps can crash loot resolution.", "",
+        "Report other issues in the GitHub issue tracker. Include the", "exact seed, version, conditions, and coordinates/structure.", "",
+        "DISCLAIMER", "", "This program is free software under the GNU GPL v3 or later.",
+        "It is distributed without any warranty. L opens the license.", "",
+        "NOT AN OFFICIAL MINECRAFT PRODUCT. NOT AFFILIATED WITH OR", "ENDORSED BY MOJANG AB OR MICROSOFT."
+    ]
+
+    private func drawAboutPopup(_ renderer: OpaquePointer) {
+        var box = SDL_Rect(x: Int32(mapWidth / 8), y: Int32(mapHeight / 8), w: Int32(mapWidth * 3 / 4), h: Int32(mapHeight * 3 / 4))
+        SDL_SetRenderDrawColor(renderer, 247, 244, 234, 255)
+        SDL_RenderFillRect(renderer, &box)
+        drawText(renderer, text: "ABOUT DAPPERMAP", x: Int(box.x) + 20, y: Int(box.y) + 20, scale: 2)
+        drawText(renderer, text: "Minecraft seed mapper with datapack and loot support.", x: Int(box.x) + 20, y: Int(box.y) + 58, scale: 1)
+        drawText(renderer, text: "1 SOURCE   2 DPReader   3 LICENSE   ENTER/ESC CLOSE", x: Int(box.x) + 20, y: Int(box.y) + 84, scale: 1)
     }
 
     private func selectSidebarTab(atX x: Int32, y: Int32) {
