@@ -28,7 +28,7 @@
 /* The main map keeps its original fixed sidebar layout. About is now a separate page. */
 .shell { grid-template-columns:clamp(16rem,28vw,30rem) minmax(0,1fr); gap:1.25rem; }
 .sidebar-resizer { display:none; }
-.about-page { min-height:100vh; padding:1.25rem; }
+.about-page { min-height:100vh; padding:1.25rem; height:100%; overflow:auto; }
 .about-page .about { max-width:62rem; margin:0 auto; padding:clamp(1rem,4vw,3rem); background:color-mix(in srgb,var(--paper) 92%,white); border:1px solid var(--line); border-radius:1.25rem; box-shadow:0 1rem 3rem #3e57321a; }
 .about-page .about h1 { margin-top:0; }
 .about-link { color:var(--green); font-weight:bold; }
