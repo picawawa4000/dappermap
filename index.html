@@ -25,6 +25,22 @@
     document.querySelector("#minecraft-version-input").insertAdjacentHTML("beforeend", '<option value="26.3-pre-1">26.3-pre-1 (Experimental)</option>');
     const wasmCompilationPreference = localStorage.getItem("dappermap-wasm-compilation") ?? "auto";
     window.__dappermapWASMCompilationPreference = wasmCompilationPreference;
+    // A normal Content-Encoding response is already decompressed by fetch. GitHub Pages,
+    // however, serves our .gz datapack bundles as application/gzip files without that header.
+    // Inflate only those raw gzip responses so both hosting styles produce JSON text.
+    window.dappermapResponseText = async response => {
+      const contentEncoding = response.headers.get("content-encoding");
+      if (contentEncoding && contentEncoding.toLowerCase() !== "identity") return response.text();
+      const contentType = response.headers.get("content-type") ?? "";
+      const isRawGzip = contentType.toLowerCase().includes("gzip")
+        || new URL(response.url).pathname.toLowerCase().endsWith(".gz");
+      if (!isRawGzip) return response.text();
+      if (typeof DecompressionStream !== "function") {
+        throw new Error("This browser cannot decompress the downloaded datapack bundle.");
+      }
+      if (!response.body) throw new Error("The downloaded datapack bundle has no response body.");
+      return new Response(response.body.pipeThrough(new DecompressionStream("gzip"))).text();
+    };
     document.querySelector('[data-page-panel="map"]').insertAdjacentHTML("afterbegin", '<p><a class="about-link" href="./about.html">About DapperMap</a></p>');
     // About is a standalone page; discard the legacy hidden panel created by older page markup.
     queueMicrotask(() => document.querySelector('[data-page-panel="about"]')?.remove());

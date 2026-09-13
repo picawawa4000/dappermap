@@ -1293,7 +1293,11 @@ final class BrowserApp: DapperMapPlatform {
                 return .undefined
             }
 
-            let textPromise = response.text!().object!
+            guard let responseText = JSObject.global["dappermapResponseText"].function else {
+                completion(.failure(.message("The browser response decoder is unavailable.")))
+                return .undefined
+            }
+            let textPromise = responseText(response).object!
             let textClosure = JSClosure { textArgs in
                 completion(.success(textArgs.first?.string ?? ""))
                 return .undefined
