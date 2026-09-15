@@ -9,6 +9,7 @@ for candidate in /opt/homebrew/bin/wasm-opt /usr/local/bin/wasm-opt /usr/bin/was
             --enable-threads \
             --enable-bulk-memory \
             --enable-sign-ext \
+            --enable-mutable-globals \
             --enable-nontrapping-float-to-int \
             "$@"
     fi
