@@ -19,12 +19,15 @@ jobs:
       - name: Install Swift
         uses: swift-actions/setup-swift@v3
         with:
-          swift-version: "6.3.3"
+          # SwiftWasm publishes a threaded SDK for this release. 6.3.3 is not
+          # currently present in the SwiftWasm SDK index.
+          swift-version: "6.3.2"
 
       - name: Install the threaded WASM SDK
         id: wasm-sdk
         uses: swiftwasm/setup-swiftwasm@v2
         with:
+          tag: swift-6.3.2-RELEASE
           target: wasm32-unknown-wasip1-threads
 
       - name: Install Binaryen
