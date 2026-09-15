@@ -2180,7 +2180,13 @@ final class BrowserApp: DapperMapPlatform {
             renderLootSearch(message: "Start X, Start Z, and radius must be whole numbers.", isError: true)
             return
         }
-        let query = LootSearchQuery(startX: x, startZ: z, radius: radius, itemQuery: lootSearchItemInput.value.string ?? "")
+        let query = LootSearchQuery(
+            startX: x,
+            startZ: z,
+            radius: radius,
+            itemQuery: lootSearchItemInput.value.string ?? "",
+            dimensionID: currentDimensionID
+        )
         inFlightLootSearchTask?.cancel()
         lootSearchRequest += 1
         let request = lootSearchRequest

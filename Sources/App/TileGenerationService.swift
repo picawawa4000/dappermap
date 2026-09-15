@@ -445,7 +445,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             throw BrowserAppError.message("Structure generation worker is not ready.")
         }
         let worldSeed = UInt64(bitPattern: seed)
-        try configureGenerator(for: worldSeed, dimensionID: "minecraft:overworld", using: dataPack)
+        try configureGenerator(for: worldSeed, dimensionID: query.dimensionID, using: dataPack)
         guard let generator else { throw BrowserAppError.message("Structure generation worker is not ready.") }
         let minimum = -query.radius
         let maximum = query.radius
@@ -456,13 +456,13 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         let structures = try structures(
             in: StructureQuery(
                 seed: worldSeed,
-                dimensionID: "minecraft:overworld",
+                dimensionID: query.dimensionID,
                 minX: minX, maxX: maxX, minZ: minZ, maxZ: maxZ,
                 enabledStructureSets: Set(structureSetDescriptors.map(\.keyName)),
                 minimumSpacingBlocks: 0
             ),
             biomeSampler: { position in
-                try generator.sampleBiome(at: position, in: self.dimensionKey(for: "minecraft:overworld"))
+                try generator.sampleBiome(at: position, in: self.dimensionKey(for: query.dimensionID))
             }
         )?.points ?? []
         var matches: [MapLootPresentation] = []
@@ -1083,6 +1083,15 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         biomeSampler: @escaping (PosInt3D) throws -> RegistryKey<Biome>?
     ) throws -> StructureStartValidationContext {
         let dimension = dimensionKey(for: dimensionID)
+        // End-city validation is sensitive to the exact biome column at the structure's
+        // generation anchor. A coarse tile cache can snap the old chunk-center coordinate and
+        // the anchor (+7, +7) to the same sample, defeating DPReader's end-city correction.
+        // End structures are sparse, so exact sampling here is affordable and preserves the
+        // authoritative DPReader validation behavior.
+        let validationBiomeSampler: (PosInt3D) throws -> RegistryKey<Biome>? =
+            dimensionID == "minecraft:the_end" || dimensionID == "minecraft:end"
+            ? { position in try generator.sampleBiome(at: position, in: dimension) }
+            : biomeSampler
         let terrain: GeneratedStructureHeightmapSampler
         if let existing = structureHeightmapSampler {
             terrain = existing
@@ -1102,7 +1111,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             minimumWorldY: -64,
             maximumWorldY: 319,
             heightmapSampler: terrain.height,
-            biomeSampler: biomeSampler
+            biomeSampler: validationBiomeSampler
         )
     }
 

@@ -688,7 +688,13 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             renderLootSearchText("Start X, Start Z, and radius must be whole numbers.")
             return
         }
-        let query = LootSearchQuery(startX: x, startZ: z, radius: radius, itemQuery: lootSearchItemInput?.stringValue ?? "")
+        let query = LootSearchQuery(
+            startX: x,
+            startZ: z,
+            radius: radius,
+            itemQuery: lootSearchItemInput?.stringValue ?? "",
+            dimensionID: currentDimensionID
+        )
         renderLootSearchText("Searching chests…")
         lootSearchTask?.cancel()
         lootSearchRequest += 1
@@ -721,7 +727,25 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
     }
 
     private func renderLootSearchText(_ text: String) {
-        lootSearchText?.string = text
+        guard let lootSearchText else { return }
+        let query = lootSearchItemInput?.stringValue ?? ""
+        let normalFont = NSFont(name: "Menlo", size: 11) ?? .monospacedSystemFont(ofSize: 11, weight: .regular)
+        let result = NSMutableAttributedString()
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        for (index, line) in lines.enumerated() {
+            let value = String(line)
+            let item = value.hasPrefix("    • ") ? String(value.dropFirst(6)) : nil
+            let matches = item.map { LootSearchMatcher.matches(item: $0, query: query) } ?? false
+            result.append(NSAttributedString(
+                string: value + (index + 1 < lines.count ? "\n" : ""),
+                attributes: [
+                    .font: normalFont,
+                    .foregroundColor: matches ? NSColor.black : NSColor.labelColor,
+                    .backgroundColor: matches ? NSColor.systemYellow.withAlphaComponent(0.6) : NSColor.clear
+                ]
+            ))
+        }
+        lootSearchText.textStorage?.setAttributedString(result)
     }
 
     private func applyLootSearch(_ progress: LootSearchProgress) {

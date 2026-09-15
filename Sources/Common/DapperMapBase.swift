@@ -72,12 +72,20 @@ public struct LootSearchQuery: Sendable {
     public let startZ: Int32
     public let radius: Int32
     public let itemQuery: String
+    public let dimensionID: String
 
-    public init(startX: Int32, startZ: Int32, radius: Int32, itemQuery: String) {
+    public init(
+        startX: Int32,
+        startZ: Int32,
+        radius: Int32,
+        itemQuery: String,
+        dimensionID: String = "minecraft:overworld"
+    ) {
         self.startX = startX
         self.startZ = startZ
         self.radius = radius
         self.itemQuery = itemQuery
+        self.dimensionID = dimensionID
     }
 }
 

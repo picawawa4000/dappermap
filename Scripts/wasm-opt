@@ -3,7 +3,7 @@ set -eu
 
 # JavaScriptKit 0.56 invokes wasm-opt without the feature flags required by the
 # threaded WASI SDK. Keep this shim ahead of the real binary in build_web.sh.
-for candidate in /opt/homebrew/bin/wasm-opt /usr/local/bin/wasm-opt; do
+for candidate in /opt/homebrew/bin/wasm-opt /usr/local/bin/wasm-opt /usr/bin/wasm-opt; do
     if [ -x "$candidate" ]; then
         exec "$candidate" \
             --enable-threads \

@@ -1,0 +1,87 @@
+name: Deploy Webapp to GitHub Pages
+
+on:
+  workflow_dispatch:
+
+# The destination is a different repository, so GITHUB_TOKEN is not sufficient.
+# Create PAGES_DEPLOY_TOKEN there with contents: write permission and save it as
+# an Actions secret in this repository.
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out DapperMap
+        uses: actions/checkout@v4
+
+      - name: Install Swift
+        uses: swift-actions/setup-swift@v3
+        with:
+          swift-version: "6.3.3"
+
+      - name: Install the threaded WASM SDK
+        id: wasm-sdk
+        uses: swiftwasm/setup-swiftwasm@v2
+        with:
+          target: wasm32-unknown-wasip1-threads
+
+      - name: Install Binaryen
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes binaryen
+
+      - name: Build the web app
+        run: Scripts/build_web.sh
+        env:
+          SWIFT_SDK_ID: ${{ steps.wasm-sdk.outputs.swift-sdk-id }}
+
+      - name: Check out the Pages repository
+        uses: actions/checkout@v4
+        with:
+          repository: picawawa4000/picawawa4000.github.io
+          token: ${{ secrets.PAGES_DEPLOY_TOKEN }}
+          path: pages-repository
+          persist-credentials: false
+
+      - name: Stage DapperMap for Pages
+        run: |
+          set -euo pipefail
+          site=pages-repository/dappermap
+          package=.build/plugins/PackageToJS/outputs/Package
+
+          test -d "$package"
+          test -f "$site/coi-serviceworker.min.js"
+          mkdir -p "$site/Package" "$site/Web"
+          rsync -a --delete "$package/" "$site/Package/"
+          rsync -a --delete Web/ "$site/Web/"
+          cp index.html about.html styles.css "$site/"
+
+          # The Pages copy is served from /dappermap/, rather than this source
+          # checkout, and needs a cross-origin-isolation service worker.
+          sed -i 's#\./\.build/plugins/PackageToJS/outputs/Package/#./Package/#g' "$site/index.html"
+          if ! grep -Fq 'coi-serviceworker.min.js' "$site/index.html"; then
+            sed -i '/<head>/a\  <script src="coi-serviceworker.min.js"></script>' "$site/index.html"
+          fi
+
+      - name: Commit and push Pages changes
+        run: |
+          set -euo pipefail
+          git -C pages-repository config user.name 'github-actions[bot]'
+          git -C pages-repository config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C pages-repository add \
+            dappermap/Package \
+            dappermap/Web \
+            dappermap/index.html \
+            dappermap/about.html \
+            dappermap/styles.css
+          if git -C pages-repository diff --cached --quiet; then
+            exit 0
+          fi
+          git -C pages-repository commit -m 'Deploy DapperMap from ${GITHUB_SHA}'
+          git -C pages-repository push \
+            "https://x-access-token:${PAGES_DEPLOY_TOKEN}@github.com/picawawa4000/picawawa4000.github.io.git" \
+            HEAD:main
+        env:
+          PAGES_DEPLOY_TOKEN: ${{ secrets.PAGES_DEPLOY_TOKEN }}
