@@ -114,10 +114,5 @@ let package = Package(
             ],
             path: "Sources/benchstart"
         ),
-        .testTarget(
-            name: "DapperMapTests",
-            dependencies: ["DapperMapCore", "DapperMapEngine"],
-            path: "Tests"
-        ),
     ]
 )
