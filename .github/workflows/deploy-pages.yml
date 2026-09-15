@@ -22,6 +22,9 @@ jobs:
           # SwiftWasm publishes a threaded SDK for this release. 6.3.3 is not
           # currently present in the SwiftWasm SDK index.
           swift-version: "6.3.2"
+          # setup-swift's keyring bootstrap currently fails on GitHub-hosted
+          # runners ("Can't check signature: No public key").
+          skip-verify-signature: true
 
       - name: Install the threaded WASM SDK
         id: wasm-sdk
