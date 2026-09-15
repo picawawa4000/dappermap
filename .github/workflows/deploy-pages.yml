@@ -38,6 +38,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes binaryen
 
+      - name: Resolve Swift packages
+        run: swift package resolve
+
+      - name: Extract vanilla datapacks
+        run: |
+          set -euo pipefail
+          extractor=.build/checkouts/dpreader-swift/Scripts/extract_vanilla_datapack.py
+          for version in 1.21 1.21.2 1.21.4 1.21.5 1.21.6 1.21.9 1.21.11 26.1 26.2 26.3-pre-1; do
+            python3 "$extractor" --version "$version" --dest "Data/$version"
+          done
+
       - name: Build the web app
         run: Scripts/build_web.sh
         env:
