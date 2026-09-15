@@ -8,7 +8,6 @@ for candidate in /opt/homebrew/bin/wasm-opt /usr/local/bin/wasm-opt /usr/bin/was
         exec "$candidate" \
             --enable-threads \
             --enable-bulk-memory \
-            --enable-bulk-memory-opt \
             --enable-nontrapping-float-to-int \
             "$@"
     fi
