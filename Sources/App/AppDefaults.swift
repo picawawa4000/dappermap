@@ -24,6 +24,7 @@ let vanillaBiomeDefaults: [String: BiomeColor] = [
     "minecraft:cherry_grove": BiomeColor(red: 220, green: 160, blue: 180),
     "minecraft:cold_ocean": BiomeColor(red: 40, green: 80, blue: 180),
     "minecraft:crimson_forest": BiomeColor(red: 130, green: 20, blue: 20),
+    "minecraft:dappled_forest": BiomeColor(red: 220, green: 110, blue: 0),
     "minecraft:dark_forest": BiomeColor(red: 20, green: 80, blue: 20),
     "minecraft:deep_cold_ocean": BiomeColor(red: 30, green: 70, blue: 150),
     "minecraft:deep_dark": BiomeColor(red: 20, green: 30, blue: 35),

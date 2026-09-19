@@ -5,7 +5,7 @@ DapperMap is a seed viewer for Minecraft. It supports biomes, structure position
 It is based on DPReader, which can be found at <https://github.com/picawawa4000/dpreader-swift>. Generation errors should be reported there, while map errors should be reported here.
 
 All frontends offer the first release for every distinct vanilla worldgen state from 1.21 through
-26.2, plus experimental 26.3-pre-1 support; releases without worldgen changes use the preceding
+26.3; releases without worldgen changes use the preceding
 entry. 1.21.11 remains the default. The
 AppKit selector is in the Map panel; SDL uses Z/X to change version and Ctrl/Cmd-V/C for seed
 clipboard operations. Native versions load

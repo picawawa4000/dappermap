@@ -28,6 +28,7 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     private var initializingDatapack: (rootURL: URL, packFormat: Version)?
     private var initializationTask: Task<Void, Error>?
     private var stagedRoots: [String: URL] = [:]
+    private var sharedDataPack: SharedLoadedDataPack?
 
     public init(
         threadCount: Int,
@@ -69,13 +70,16 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
                initializedDatapack?.packFormat == datapack.packFormat { return }
         }
 
-        let workers = self.workers + self.lootSearchWorkers
         let loadingRoot = try stageRootIfNeeded(rootURL: standardizedRootURL, packFormat: packFormat)
+        // Decoding templates and registry graphs dominates native memory. Load one frozen pack
+        // and share it read-only; every worker still builds its own mutable WorldGenerator.
+        let sharedDataPack = try SharedLoadedDataPack(rootURL: loadingRoot, decodingVersion: packFormat)
+        let workers = self.workers + self.lootSearchWorkers
         let task = Task {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for worker in workers {
                     group.addTask {
-                        try await worker.initialize(rootURL: loadingRoot, decodingVersion: packFormat)
+                        try await worker.initialize(sharedDataPack: sharedDataPack)
                     }
                 }
                 try await group.waitForAll()
@@ -86,6 +90,7 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
         do {
             try await task.value
             initializedDatapack = datapack
+            self.sharedDataPack = sharedDataPack
             initializingDatapack = nil
             initializationTask = nil
         } catch {

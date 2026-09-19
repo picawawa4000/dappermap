@@ -10,6 +10,28 @@ import AppKit
 import CoreGraphics
 #endif
 
+/// The on-disk representation of an item tag.  DPReader's tag registry deliberately keeps its
+/// entries internal, while static loot analysis accepts a resolver, so retain this small decoder
+/// at the application boundary.
+private struct LootSearchItemTag: Decodable {
+    let values: [LootSearchItemTagValue]
+}
+
+private enum LootSearchItemTagValue: Decodable {
+    case identifier(String)
+
+    init(from decoder: Decoder) throws {
+        if let identifier = try? decoder.singleValueContainer().decode(String.self) {
+            self = .identifier(identifier)
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self = .identifier(try container.decode(String.self, forKey: .id))
+    }
+
+    private enum CodingKeys: String, CodingKey { case id }
+}
+
 #if canImport(wasi_pthread)
 import wasi_pthread
 import WASILibc
@@ -74,6 +96,43 @@ private final class ReusableBiomeTileSampler {
             indices[outputIndex] = compactIndex
         }
         return (compactPalette, indices)
+    }
+}
+
+/// A datapack is fully populated before this wrapper is handed to generation actors. DPReader's
+/// registries are ordinary dictionaries, so they must remain read-only after that point; each
+/// worker owns its mutable `WorldGenerator` and all seed-dependent caches separately.
+///
+/// `DataPack` does not currently declare `Sendable`, despite this read-only use being safe. Keep
+/// the unchecked boundary narrow until DPReader can expose an immutable datapack type.
+final class SharedLoadedDataPack: @unchecked Sendable {
+    let rootURL: URL
+    let dataPack: DataPack
+    let structureSetDescriptors: [StructureSetDescriptor]
+
+    init(rootURL: URL, decodingVersion: Version) throws {
+        self.rootURL = rootURL
+        let dataPack = try DataPack(
+            fromRootPath: rootURL,
+            loadingOptions: [],
+            decodingVersion: decodingVersion
+        )
+        self.dataPack = dataPack
+        self.structureSetDescriptors = try Self.makeStructureSetDescriptors(from: dataPack)
+    }
+
+    static func makeStructureSetDescriptors(from dataPack: DataPack) throws -> [StructureSetDescriptor] {
+        try dataPack.structureSetRegistry.entries().compactMap { entry in
+            let data = try JSONEncoder().encode(entry.value)
+            let encoded = try JSONDecoder().decode(EncodedStructureSet.self, from: data)
+            return StructureSetDescriptor(
+                keyName: entry.key.name,
+                kind: encoded.placement.type,
+                spacing: encoded.placement.spacing,
+                frequency: encoded.placement.frequency,
+                structureIDs: encoded.structures.map(\.structure)
+            )
+        }
     }
 }
 
@@ -150,6 +209,11 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     }
 #endif
 
+    // The item sets are independent of world seed.  Keeping them alongside the loaded datapack
+    // makes repeated searches avoid both template discovery and loot-table decoding.
+    private var staticLootItemsByStructureID: [String: Set<String>] = [:]
+    private var staticLootItemTagCache: [String: [String]] = [:]
+
 #if os(WASI)
     nonisolated func scheduleLoot(
         for structure: StructurePoint,
@@ -173,18 +237,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             fromRootPath: rootURL,
             loadingOptions: []
         )
-        structureSetDescriptors = try dataPack!.structureSetRegistry.entries().compactMap { entry in
-            let data = try JSONEncoder().encode(entry.value)
-            let encoded = try JSONDecoder().decode(EncodedStructureSet.self, from: data)
-            return StructureSetDescriptor(
-                keyName: entry.key.name,
-                kind: encoded.placement.type,
-                spacing: encoded.placement.spacing,
-                frequency: encoded.placement.frequency,
-                structureIDs: encoded.structures.map(\.structure)
-            )
-        }
-        try prewarmCompiledDensityFunctions()
+        try finishInitializingDataPack()
     }
 
     func initialize(rootURL: URL, decodingVersion: Version? = nil) throws {
@@ -195,17 +248,24 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             loadingOptions: [],
             decodingVersion: decodingVersion
         )
-        structureSetDescriptors = try dataPack!.structureSetRegistry.entries().compactMap { entry in
-            let data = try JSONEncoder().encode(entry.value)
-            let encoded = try JSONDecoder().decode(EncodedStructureSet.self, from: data)
-            return StructureSetDescriptor(
-                keyName: entry.key.name,
-                kind: encoded.placement.type,
-                spacing: encoded.placement.spacing,
-                frequency: encoded.placement.frequency,
-                structureIDs: encoded.structures.map(\.structure)
-            )
+        try finishInitializingDataPack()
+    }
+
+    /// Native workers share the immutable decoded pack but retain independent generators, so
+    /// density-function baking and terrain caches cannot race between requests.
+    func initialize(sharedDataPack: SharedLoadedDataPack) throws {
+        resetForDatapackReload()
+        dataPackRoot = sharedDataPack.rootURL
+        dataPack = sharedDataPack.dataPack
+        structureSetDescriptors = sharedDataPack.structureSetDescriptors
+        try prewarmCompiledDensityFunctions()
+    }
+
+    private func finishInitializingDataPack() throws {
+        guard let dataPack else {
+            throw BrowserAppError.message("Structure generation worker is not ready.")
         }
+        structureSetDescriptors = try SharedLoadedDataPack.makeStructureSetDescriptors(from: dataPack)
         try prewarmCompiledDensityFunctions()
     }
 
@@ -465,6 +525,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 try generator.sampleBiome(at: position, in: self.dimensionKey(for: query.dimensionID))
             }
         )?.points ?? []
+        let staticallyEligibleStructureIDs = staticCandidateStructureIDs(for: structures, query: itemQuery)
         var matches: [MapLootPresentation] = []
         for (index, structure) in structures.enumerated() {
             try Task.checkCancellation()
@@ -481,6 +542,16 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             await Task.yield()
             try Task.checkCancellation()
 #endif
+            // Statically rejected structures avoid terrain, piece-graph, container, and random
+            // loot generation. Explicit descriptor searches remain on the full path because
+            // their values are generated item components rather than base item IDs.
+            guard staticallyEligibleStructureIDs?.contains(structure.structureID) ?? true else {
+                onProgress(LootSearchProgress(
+                    structuresScanned: index + 1, totalStructures: structures.count,
+                    currentStructure: presentation
+                ))
+                continue
+            }
             let newMatches: [MapLootPresentation] = try loot(for: structure, seed: worldSeed).compactMap { container -> MapLootPresentation? in
                 guard container.loot.contains(where: { LootSearchMatcher.matches(item: $0, query: itemQuery) }) else {
                     return nil
@@ -500,6 +571,87 @@ actor TileGenerationService: DapperMapGenerationPlatform {
 #endif
         }
         return matches.sorted { ($0.z, $0.x, $0.y, $0.block) < ($1.z, $1.x, $1.y, $1.block) }
+    }
+
+    /// Narrows an item-name search to structure types whose static loot analysis contains a
+    /// matching base item. `item:` terms always opt in. Plain terms opt in only when analysis
+    /// finds at least one item globally, which preserves the full descriptor-search path for
+    /// queries such as `sharpness` or `healing`.
+    private func staticCandidateStructureIDs(for structures: [StructurePoint], query: String) -> Set<String>? {
+        let terms = query.lowercased().split(whereSeparator: \.isWhitespace)
+        guard !terms.isEmpty else { return nil }
+        let itemQualified = terms.allSatisfy { $0.hasPrefix("item:") && $0.count > 5 }
+        let plainItemName = terms.allSatisfy { !$0.contains(":") }
+        guard itemQualified || plainItemName else { return nil }
+
+        var candidateIDs: Set<String> = []
+        for structureID in Set(structures.map(\.structureID)) {
+            // If analysis cannot cover a structure, retain it on the generation path.
+            guard let items = staticLootItems(for: structureID) else {
+                candidateIDs.insert(structureID)
+                continue
+            }
+            if items.contains(where: { LootSearchMatcher.matches(item: $0, query: query) }) {
+                candidateIDs.insert(structureID)
+            }
+        }
+        // A bare word might instead be an enchantment, potion, or effect. If it has no item
+        // interpretation at all, retain legacy behavior rather than produce an empty search.
+        return itemQualified || !candidateIDs.isEmpty ? candidateIDs : nil
+    }
+
+    private func staticLootItems(for structureID: String) -> Set<String>? {
+        if let items = staticLootItemsByStructureID[structureID] { return items }
+        guard let dataPack, let rootURL = dataPackRoot,
+              let definition = dataPack.structureRegistry.get(RegistryKey(referencing: structureID)) else {
+            return nil
+        }
+        do {
+            let context = StructureGenerationContext(seaLevel: 63, minimumWorldY: -64, usingDataPacks: [dataPack])
+            let items = try definition.listItems(
+                context: context,
+                resolvingTables: { identifier in try self.loadLootTable(identifier, rootURL: rootURL, decoder: dataPack.makeDecoder()) },
+                resolvingItemTags: { identifier in try self.resolveLootItemTag(identifier, rootURL: rootURL) }
+            )
+            let result = Set(items)
+            staticLootItemsByStructureID[structureID] = result
+            return result
+        } catch {
+            return nil
+        }
+    }
+
+    private func loadLootTable(_ identifier: String, rootURL: URL, decoder: JSONDecoder) throws -> LootTable {
+        let parts = identifier.split(separator: ":", maxSplits: 1)
+        let namespace = parts.count == 2 ? String(parts[0]) : "minecraft"
+        let path = parts.count == 2 ? String(parts[1]) : identifier
+        let tableURL = rootURL.appendingPathComponent("data/\(namespace)/loot_table/\(path).json")
+        return try decoder.decode(LootTable.self, from: Data(contentsOf: tableURL))
+    }
+
+    private func resolveLootItemTag(_ identifier: String, rootURL: URL) throws -> [String] {
+        let normalized = identifier.contains(":") ? identifier : "minecraft:\(identifier)"
+        if let items = staticLootItemTagCache[normalized] { return items }
+        var visited: Set<String> = []
+        func resolve(_ tagID: String) throws -> [String] {
+            let tagID = tagID.contains(":") ? tagID : "minecraft:\(tagID)"
+            guard visited.insert(tagID).inserted else { return [] }
+            defer { visited.remove(tagID) }
+            let parts = tagID.split(separator: ":", maxSplits: 1)
+            let url = rootURL.appendingPathComponent("data/\(parts[0])/tags/item/\(parts[1]).json")
+            let tag = try JSONDecoder().decode(LootSearchItemTag.self, from: Data(contentsOf: url))
+            return try tag.values.flatMap { value in
+                switch value {
+                case .identifier(let id) where id.hasPrefix("#"):
+                    return try resolve(String(id.dropFirst()))
+                case .identifier(let id):
+                    return [id.contains(":") ? id : "minecraft:\(id)"]
+                }
+            }
+        }
+        let items = try resolve(normalized)
+        staticLootItemTagCache[normalized] = items
+        return items
     }
 
     // Structure starts are generated as part of a tile after its biome cache exists. Keep the
@@ -1352,6 +1504,8 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         emptyRandomStructureRegions.removeAll(keepingCapacity: true)
         concentricStructurePlacements.removeAll(keepingCapacity: true)
         structureHeightmapSampler = nil
+        staticLootItemsByStructureID.removeAll(keepingCapacity: true)
+        staticLootItemTagCache.removeAll(keepingCapacity: true)
         dataPackRoot = nil
 #if os(WASI)
         wasmRuntime?.invalidate()

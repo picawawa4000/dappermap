@@ -22,7 +22,7 @@
     <section class="map-stage"><div id="map-viewport" class="map-frame" tabindex="0" aria-label="Interactive world map. Click a structure marker to inspect its loot containers."><canvas id="map-canvas"></canvas><canvas id="map-overlay" aria-hidden="true"></canvas><div id="map-tooltip" class="map-tooltip" role="tooltip" hidden></div></div></section>
   </main>
   <script>
-    document.querySelector("#minecraft-version-input").insertAdjacentHTML("beforeend", '<option value="26.3-pre-1">26.3-pre-1 (Experimental)</option>');
+    document.querySelector("#minecraft-version-input").insertAdjacentHTML("beforeend", '<option value="26.3">26.3</option>');
     const wasmCompilationPreference = localStorage.getItem("dappermap-wasm-compilation") ?? "auto";
     window.__dappermapWASMCompilationPreference = wasmCompilationPreference;
     // A normal Content-Encoding response is already decompressed by fetch. GitHub Pages,

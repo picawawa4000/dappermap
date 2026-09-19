@@ -50,7 +50,7 @@ public let vanillaDatapacks: [VanillaDatapack] = [
     VanillaDatapack(version: "1.21.11", bundlePath: "./Web/vanilla-1.21.11-datapack.bundle.json.gz", packFormat: Version(major: 94, minor: 1)),
     VanillaDatapack(version: "26.1", bundlePath: "./Web/vanilla-26.1-datapack.bundle.json.gz", packFormat: Version(major: 101, minor: 1)),
     VanillaDatapack(version: "26.2", bundlePath: "./Web/vanilla-26.2-datapack.bundle.json.gz", packFormat: Version(major: 107, minor: 1)),
-    VanillaDatapack(version: "26.3-pre-1", bundlePath: "./Web/vanilla-26.3-pre-1-datapack.bundle.json.gz", packFormat: Version(major: 119, minor: 0))
+    VanillaDatapack(version: "26.3", bundlePath: "./Web/vanilla-26.3-datapack.bundle.json.gz", packFormat: Version(major: 121, minor: 0))
 ]
 
 public let defaultVanillaDatapack = vanillaDatapacks[6]

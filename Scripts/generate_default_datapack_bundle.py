@@ -9,7 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 VANILLA_WORLDGEN_VERSIONS = [
-    "1.21", "1.21.2", "1.21.4", "1.21.5", "1.21.6", "1.21.9", "1.21.11", "26.1", "26.2", "26.3-pre-1",
+    "1.21", "1.21.2", "1.21.4", "1.21.5", "1.21.6", "1.21.9", "1.21.11", "26.1", "26.2", "26.3",
 ]
 
 # Client jars contain the built-in data tree but not its root pack metadata. DPReader must receive
@@ -24,7 +24,7 @@ PACK_METADATA = {
     "1.21.11": {"min_format": [94, 1], "max_format": [94, 1]},
     "26.1": {"min_format": [101, 1], "max_format": [101, 1]},
     "26.2": {"min_format": [107, 1], "max_format": [107, 1]},
-    "26.3-pre-1": {"min_format": [119, 0], "max_format": [119, 0]},
+    "26.3": {"min_format": [121, 0], "max_format": [121, 0]},
 }
 
 INCLUDE_GLOBS = [
