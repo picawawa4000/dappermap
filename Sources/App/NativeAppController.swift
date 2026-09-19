@@ -296,6 +296,17 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             input.action = #selector(renderSeed)
             stack.addArrangedSubview(input)
             seedInput = input
+            let seedActions = NSStackView()
+            seedActions.orientation = .horizontal
+            seedActions.distribution = .fillEqually
+            seedActions.spacing = 8
+            let randomButton = NSButton(title: "Random Seed", target: self, action: #selector(randomSeed))
+            let renderButton = NSButton(title: "Render", target: self, action: #selector(renderSeed))
+            renderButton.keyEquivalent = "\r"
+            seedActions.addArrangedSubview(randomButton)
+            seedActions.addArrangedSubview(renderButton)
+            seedActions.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            stack.addArrangedSubview(seedActions)
             stack.addArrangedSubview(label(dimensionField?.label ?? "Dimension", size: 15, bold: true))
             let dimensionPicker = NSPopUpButton(frame: .zero, pullsDown: false)
             dimensionPicker.addItem(withTitle: dimensionField?.value ?? "minecraft:overworld")
@@ -312,11 +323,6 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             yField.action = #selector(renderSeed)
             stack.addArrangedSubview(yField)
             yInput = yField
-            let button = NSButton(title: "Render", target: self, action: #selector(renderSeed))
-            button.bezelStyle = .rounded
-            button.keyEquivalent = "\r"
-            button.widthAnchor.constraint(equalToConstant: 324).isActive = true
-            stack.addArrangedSubview(button)
             stack.addArrangedSubview(label("Status", size: 15, bold: true))
             let status = wrappingLabel("Loading Minecraft \(selectedDatapack.version) datapack…")
             status.widthAnchor.constraint(equalToConstant: 324).isActive = true
@@ -386,9 +392,17 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
                 stack.addArrangedSubview(field)
                 self[keyPath: keyPath] = field
             }
-            let button = NSButton(title: "Search Chests", target: self, action: #selector(searchLoot))
-            button.widthAnchor.constraint(equalToConstant: 324).isActive = true
-            stack.addArrangedSubview(button)
+            let searchLocation = NSButton(title: "Use Map Center", target: self, action: #selector(useMapCenterForLootSearch))
+            searchLocation.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            stack.addArrangedSubview(searchLocation)
+            let searchActions = NSStackView()
+            searchActions.orientation = .horizontal
+            searchActions.distribution = .fillEqually
+            searchActions.spacing = 8
+            searchActions.addArrangedSubview(NSButton(title: "Search Chests", target: self, action: #selector(searchLoot)))
+            searchActions.addArrangedSubview(NSButton(title: "Cancel", target: self, action: #selector(cancelLootSearch)))
+            searchActions.widthAnchor.constraint(equalToConstant: 324).isActive = true
+            stack.addArrangedSubview(searchActions)
             let progress = NSProgressIndicator()
             progress.isIndeterminate = false
             progress.minValue = 0
@@ -881,6 +895,25 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             mapView.lootContainers.removeAll()
         }
         scheduleRender(immediately: true)
+    }
+
+    @objc private func randomSeed() {
+        seedInput?.stringValue = String(Int64.random(in: Int64.min...Int64.max))
+        renderSeed()
+    }
+
+    @objc private func useMapCenterForLootSearch() {
+        lootSearchXInput?.stringValue = "\(Int32(clamping: Int(mapView.centerX.rounded())))"
+        lootSearchZInput?.stringValue = "\(Int32(clamping: Int(mapView.centerZ.rounded())))"
+    }
+
+    @objc private func cancelLootSearch() {
+        guard lootSearchTask != nil else { return }
+        lootSearchTask?.cancel()
+        lootSearchTask = nil
+        lootSearchRequest += 1
+        lootSearchCurrentLabel?.stringValue = "Cancelled."
+        renderLootSearchGroups("Cancelled. \(lootSearchResults.count) matching chest\(lootSearchResults.count == 1 ? "" : "s") kept.")
     }
 
     @objc private func advancedThreadCountChanged(_ sender: NSStepper) {

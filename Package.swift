@@ -107,6 +107,11 @@ let package = Package(
             dependencies: ["DapperMapCore", "DapperMapEngine", "SDL2"],
             path: "Sources/SDL"
         ),
+        .testTarget(
+            name: "SDLInterfaceTests",
+            dependencies: ["dappermap-sdl", "SDL2", "DapperMapCore", "DapperMapEngine"],
+            path: "Tests/SDLInterfaceTests"
+        ),
         .executableTarget(
             name: "benchstart",
             dependencies: [

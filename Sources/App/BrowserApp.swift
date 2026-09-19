@@ -24,6 +24,7 @@ final class BrowserApp: DapperMapPlatform {
     private let dimensionInput: JSObject
     private let yInput: JSObject
     private let renderButton: JSObject
+    private let randomSeedButton: JSObject
     private let statusElement: JSObject
     private let biomeGenerationStatusElement: JSObject
     private let structureGenerationStatusElement: JSObject
@@ -48,6 +49,8 @@ final class BrowserApp: DapperMapPlatform {
     private let lootSearchRadiusInput: JSObject
     private let lootSearchItemInput: JSObject
     private let lootSearchButton: JSObject
+    private let lootSearchCenterButton: JSObject
+    private let lootSearchCancelButton: JSObject
     private let lootSearchMessageElement: JSObject
     private let lootSearchProgressElement: JSObject
     private let lootSearchCurrentElement: JSObject
@@ -158,6 +161,7 @@ final class BrowserApp: DapperMapPlatform {
         self.dimensionInput = document.getElementById!("dimension-input").object!
         self.yInput = document.getElementById!("y-input").object!
         self.renderButton = document.getElementById!("render-button").object!
+        self.randomSeedButton = document.getElementById!("random-seed-button").object!
         self.statusElement = document.getElementById!("status").object!
         self.biomeGenerationStatusElement = document.getElementById!("biome-generation-status").object!
         self.structureGenerationStatusElement = document.getElementById!("structure-generation-status").object!
@@ -182,6 +186,8 @@ final class BrowserApp: DapperMapPlatform {
         self.lootSearchRadiusInput = document.getElementById!("loot-search-radius").object!
         self.lootSearchItemInput = document.getElementById!("loot-search-item").object!
         self.lootSearchButton = document.getElementById!("loot-search-button").object!
+        self.lootSearchCenterButton = document.getElementById!("loot-search-center-button").object!
+        self.lootSearchCancelButton = document.getElementById!("loot-search-cancel-button").object!
         self.lootSearchMessageElement = document.getElementById!("loot-search-message").object!
         self.lootSearchProgressElement = document.getElementById!("loot-search-progress").object!
         self.lootSearchCurrentElement = document.getElementById!("loot-search-current").object!
@@ -323,6 +329,14 @@ final class BrowserApp: DapperMapPlatform {
         retainedClosures.append(clickClosure)
         _ = renderButton.addEventListener!("click", clickClosure)
 
+        let randomSeedClosure = JSClosure { [weak self] _ in
+            self?.seedInput.value = String(Int64.random(in: Int64.min...Int64.max)).jsValue
+            self?.prepareRender()
+            return .undefined
+        }
+        retainedClosures.append(randomSeedClosure)
+        _ = randomSeedButton.addEventListener!("click", randomSeedClosure)
+
         let keyClosure = JSClosure { [weak self] args in
             guard let event = args.first?.object else { return .undefined }
             guard event.key.string == "Enter" else { return .undefined }
@@ -377,6 +391,22 @@ final class BrowserApp: DapperMapPlatform {
         }
         retainedClosures.append(lootSearchClosure)
         _ = lootSearchButton.addEventListener!("click", lootSearchClosure)
+
+        let lootSearchCenterClosure = JSClosure { [weak self] _ in
+            guard let self else { return .undefined }
+            self.lootSearchXInput.value = "\(Int32(clamping: Int(self.viewCenterX.rounded())))".jsValue
+            self.lootSearchZInput.value = "\(Int32(clamping: Int(self.viewCenterZ.rounded())))".jsValue
+            return .undefined
+        }
+        retainedClosures.append(lootSearchCenterClosure)
+        _ = lootSearchCenterButton.addEventListener!("click", lootSearchCenterClosure)
+
+        let lootSearchCancelClosure = JSClosure { [weak self] _ in
+            self?.cancelLootSearch()
+            return .undefined
+        }
+        retainedClosures.append(lootSearchCancelClosure)
+        _ = lootSearchCancelButton.addEventListener!("click", lootSearchCancelClosure)
 
         let biomeImportButtonClosure = JSClosure { [weak self] _ in
             self?.biomeImportInput.value = "".jsValue
@@ -1218,6 +1248,7 @@ final class BrowserApp: DapperMapPlatform {
     private func setLoading(_ loading: Bool) {
         minecraftVersionInput.disabled = loading.jsValue
         renderButton.disabled = loading.jsValue
+        randomSeedButton.disabled = loading.jsValue
         seedInput.disabled = loading.jsValue
     }
 
@@ -2214,6 +2245,17 @@ final class BrowserApp: DapperMapPlatform {
                 self.renderLootSearch(message: "Loot search failed: \(error)", isError: true)
             }
         }
+    }
+
+    private func cancelLootSearch() {
+        guard inFlightLootSearchTask != nil else { return }
+        inFlightLootSearchTask?.cancel()
+        inFlightLootSearchTask = nil
+        lootSearchRequest += 1
+        lootSearchCurrentElement.innerText = "Cancelled.".jsValue
+        renderLootSearchGroups(
+            message: "Cancelled. \(lootSearchResults.count) matching chest\(lootSearchResults.count == 1 ? "" : "s") kept."
+        )
     }
 
     private func applyLootSearch(_ progress: LootSearchProgress) {
