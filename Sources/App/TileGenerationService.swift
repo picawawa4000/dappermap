@@ -258,8 +258,46 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         dataPackRoot = sharedDataPack.rootURL
         dataPack = sharedDataPack.dataPack
         structureSetDescriptors = sharedDataPack.structureSetDescriptors
-        try prewarmCompiledDensityFunctions()
+        // Native generation is prepared lazily from the shared fixed-seed generator supplied
+        // by NativeGenerationPlatform. Do not create one private generator per worker here.
     }
+
+#if !os(WASI)
+    /// Installs a fixed-seed shared generator for one native request. The service remains actor
+    /// isolated, so placement samplers and all local caches are never shared between workers.
+    func use(sharedGenerator: SharedNativeWorldGenerator) throws {
+        guard let dataPack else {
+            throw BrowserAppError.message("Structure generation worker is not ready.")
+        }
+        let dimensionChanged = currentDimensionID != sharedGenerator.key.dimensionID
+        let seedChanged = currentSeed != sharedGenerator.key.seed
+        if dimensionChanged {
+            samplers.removeAll(keepingCapacity: true)
+            structureSampler = nil
+            validatedStructureStarts.removeAll(keepingCapacity: true)
+            rejectedStructureStarts.removeAll(keepingCapacity: true)
+            randomStructurePlacements.removeAll(keepingCapacity: true)
+            emptyRandomStructureRegions.removeAll(keepingCapacity: true)
+            concentricStructurePlacements.removeAll(keepingCapacity: true)
+            structureHeightmapSampler = nil
+        }
+        generator = sharedGenerator.generator
+        currentDimensionID = sharedGenerator.key.dimensionID
+        currentSeed = sharedGenerator.key.seed
+        usesNativeBulkSampler = sharedGenerator.usesNativeBulkSampler
+        densityCompilationMilliseconds = sharedGenerator.densityCompilationMilliseconds
+        densityCompilationBackend = sharedGenerator.densityCompilationBackend
+        if dimensionChanged || seedChanged || structureSampler == nil {
+            structureSampler = StructurePlacementSampler(withWorldSeed: sharedGenerator.key.seed, usingDataPacks: [dataPack])
+            validatedStructureStarts.removeAll(keepingCapacity: true)
+            rejectedStructureStarts.removeAll(keepingCapacity: true)
+            randomStructurePlacements.removeAll(keepingCapacity: true)
+            emptyRandomStructureRegions.removeAll(keepingCapacity: true)
+            concentricStructurePlacements.removeAll(keepingCapacity: true)
+            structureHeightmapSampler = nil
+        }
+    }
+#endif
 
     private func finishInitializingDataPack() throws {
         guard let dataPack else {

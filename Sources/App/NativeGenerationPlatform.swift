@@ -15,8 +15,65 @@ import wasi_pthread
 import WASILibc
 #endif
 #if !os(WASI)
+struct SharedWorldGeneratorKey: Hashable {
+    let seed: WorldSeed
+    let dimensionID: String
+}
+
+/// DPReader permits concurrent generation from a fixed-seed generator when callers use distinct
+/// chunks/states. Never reseed this object: an old request can safely finish on its generator
+/// after the UI has moved to another seed.
+final class SharedNativeWorldGenerator: @unchecked Sendable {
+    let key: SharedWorldGeneratorKey
+    let generator: WorldGenerator
+    let usesNativeBulkSampler: Bool
+    let densityCompilationMilliseconds: Double?
+    let densityCompilationBackend: String?
+
+    init(
+        key: SharedWorldGeneratorKey,
+        dataPack: DataPack,
+        enableDensityCompilation: Bool
+    ) throws {
+        self.key = key
+        let settingsID: String
+        switch key.dimensionID {
+        case "minecraft:the_nether", "minecraft:nether": settingsID = "minecraft:nether"
+        case "minecraft:the_end", "minecraft:end": settingsID = "minecraft:end"
+        default: settingsID = "minecraft:overworld"
+        }
+        let settings = RegistryKey<NoiseSettings>(referencing: settingsID)
+        let start = Date()
+        if enableDensityCompilation {
+            do {
+                generator = try WorldGenerator(
+                    withWorldSeed: key.seed,
+                    usingDataPacks: [dataPack],
+                    usingSettings: settings,
+                    compilationBackend: .llvm
+                )
+                usesNativeBulkSampler = true
+                densityCompilationBackend = "LLVM"
+                densityCompilationMilliseconds = Date().timeIntervalSince(start) * 1_000.0
+                return
+            } catch {
+                // LLVM is optional; preserve the existing scalar fallback.
+            }
+        }
+        generator = try WorldGenerator(
+            withWorldSeed: key.seed,
+            usingDataPacks: [dataPack],
+            usingSettings: settings
+        )
+        usesNativeBulkSampler = false
+        densityCompilationBackend = nil
+        densityCompilationMilliseconds = nil
+    }
+}
+
 public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     private let workers: [TileGenerationService]
+    private let enableDensityCompilation: Bool
     /// Search workers never service interactive tile or marker-loot requests. This keeps a
     /// potentially long radius search from consuming the map's responsive generation capacity.
     private let lootSearchWorkers: [TileGenerationService]
@@ -29,12 +86,14 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     private var initializationTask: Task<Void, Error>?
     private var stagedRoots: [String: URL] = [:]
     private var sharedDataPack: SharedLoadedDataPack?
+    private var sharedWorldGenerators: [SharedWorldGeneratorKey: SharedNativeWorldGenerator] = [:]
 
     public init(
         threadCount: Int,
         lootSearchThreadCount: Int = 1,
         enableDensityCompilation: Bool = false
     ) {
+        self.enableDensityCompilation = enableDensityCompilation
         let count = max(1, min(32, threadCount))
         let searchCount = max(1, min(4, lootSearchThreadCount))
         workers = (0..<count).map { index in
@@ -142,6 +201,8 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     public func generateTile(_ request: MapTileRequest) async throws -> MapTilePresentation {
         let workerIndex = await acquireWorker()
         do {
+            let sharedGenerator = try sharedWorldGenerator(seed: UInt64(bitPattern: request.seed), dimensionID: request.dimensionID)
+            try await workers[workerIndex].use(sharedGenerator: sharedGenerator)
             let job = PendingTileJob(
                 generation: request.generation,
                 seed: UInt64(bitPattern: request.seed),
@@ -190,6 +251,8 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     ) async throws -> [MapLootPresentation] {
         let workerIndex = await acquireWorker()
         do {
+            let sharedGenerator = try sharedWorldGenerator(seed: UInt64(bitPattern: seed), dimensionID: "minecraft:overworld")
+            try await workers[workerIndex].use(sharedGenerator: sharedGenerator)
             let result = try await workers[workerIndex].loot(
                 for: StructurePoint(
                     setID: structure.setID,
@@ -227,6 +290,8 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     ) async throws -> [MapLootPresentation] {
         let workerIndex = await acquireLootSearchWorker()
         do {
+            let sharedGenerator = try sharedWorldGenerator(seed: UInt64(bitPattern: seed), dimensionID: query.dimensionID)
+            try await lootSearchWorkers[workerIndex].use(sharedGenerator: sharedGenerator)
             let result = try await lootSearchWorkers[workerIndex].searchLoot(query, seed: seed, onProgress: onProgress)
             releaseLootSearchWorker(workerIndex)
             return result
@@ -243,6 +308,24 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
         return await withCheckedContinuation { continuation in
             waiters.append(continuation)
         }
+    }
+
+    private func sharedWorldGenerator(seed: WorldSeed, dimensionID: String) throws -> SharedNativeWorldGenerator {
+        guard let sharedDataPack else {
+            throw BrowserAppError.message("Structure generation worker is not ready.")
+        }
+        let key = SharedWorldGeneratorKey(seed: seed, dimensionID: dimensionID)
+        if let generator = sharedWorldGenerators[key] { return generator }
+        // Keep only the active configuration in the platform cache. Workers retain any prior
+        // generator until an already-running request completes, avoiding a reseed race.
+        sharedWorldGenerators.removeAll(keepingCapacity: true)
+        let generator = try SharedNativeWorldGenerator(
+            key: key,
+            dataPack: sharedDataPack.dataPack,
+            enableDensityCompilation: enableDensityCompilation
+        )
+        sharedWorldGenerators[key] = generator
+        return generator
     }
 
     private func releaseWorker(_ worker: Int) {
