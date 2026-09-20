@@ -22,6 +22,9 @@ final class SDLMapApplication {
     var tile: MapTilePresentation?
     var tiles: [SDLTileKey: MapTilePresentation] = [:]
     var tileTextures: [SDLTileKey: OpaquePointer] = [:]
+    var tileRecency: [SDLTileKey: UInt64] = [:]
+    var tileRecencyClock: UInt64 = 0
+    let maximumCachedTiles = 128
     var needsTextureRebuild = false
     var tooltip = ""
     var loot: [MapLootPresentation] = []

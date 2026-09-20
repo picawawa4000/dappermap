@@ -88,6 +88,9 @@ final class BrowserApp: DapperMapPlatform {
     private var currentDimensionID = "minecraft:overworld"
     private var awaitingFirstTileForSeed = false
     private let tileGenerator: TileGenerationService
+    private let maximumCachedTiles = 256
+    private var tileCacheRecency: [TileCacheKey: UInt64] = [:]
+    private var tileCacheRecencyClock: UInt64 = 0
     private var inFlightStructureTask: Task<Void, Never>?
     private var inFlightConcentricStructureTask: Task<Void, Never>?
     private var requestedStructureGeneration: Int?
@@ -262,6 +265,9 @@ final class BrowserApp: DapperMapPlatform {
 
         let key = TileCacheKey(seed: seed, scaleKey: scaleKey(for: job.tileBlocksPerPixel), tileX: job.tileX, tileZ: job.tileZ)
         tileCache[key] = result.tile
+        tileCacheRecencyClock &+= 1
+        tileCacheRecency[key] = tileCacheRecencyClock
+        pruneTileCacheIfOverLimit()
         if let biomeCache = result.biomeCache,
            !(job.enabledStructureSets?.isEmpty ?? false) {
             pendingTileStructureJobs.append(PendingTileStructureJob(tileJob: job, biomeCache: biomeCache))
@@ -619,6 +625,7 @@ final class BrowserApp: DapperMapPlatform {
         pendingTileJobs.removeAll(keepingCapacity: true)
         pendingTileStructureJobs.removeAll(keepingCapacity: true)
         tileCache.removeAll(keepingCapacity: true)
+        tileCacheRecency.removeAll(keepingCapacity: true)
         tileAtlas = nil
         fallbackTileAtlas = nil
         releaseAtlasCanvases()
@@ -654,6 +661,7 @@ final class BrowserApp: DapperMapPlatform {
             currentDimensionID = dimensionID
             awaitingFirstTileForSeed = true
             tileCache.removeAll(keepingCapacity: true)
+            tileCacheRecency.removeAll(keepingCapacity: true)
             pendingTileStructureJobs.removeAll(keepingCapacity: true)
             inFlightTileStructureTask?.cancel()
             tileAtlas = nil
@@ -903,6 +911,9 @@ final class BrowserApp: DapperMapPlatform {
                 structurePoints: result?.points ?? [],
                 structureMetrics: result?.metrics ?? StructureProfilingMetrics()
             )
+            tileCacheRecencyClock &+= 1
+            tileCacheRecency[key] = tileCacheRecencyClock
+            pruneTileCacheIfOverLimit()
         }
         if job.seed == currentSeed, job.dimensionID == currentDimensionID, let viewState = latestViewState {
             refreshVisibleStructures(for: viewState)
@@ -1398,6 +1409,22 @@ final class BrowserApp: DapperMapPlatform {
                 && tileStartX <= worldEndX + worldMarginX
                 && tileEndZ >= worldStartZ - worldMarginZ
                 && tileStartZ <= worldEndZ + worldMarginZ
+        }
+        tileCacheRecency = tileCacheRecency.filter { tileCache[$0.key] != nil }
+        pruneTileCacheIfOverLimit()
+    }
+
+    private func pruneTileCacheIfOverLimit() {
+        guard tileCache.count > maximumCachedTiles else { return }
+        let excess = tileCache.count - maximumCachedTiles
+        let oldest = tileCacheRecency
+            .filter { tileCache[$0.key] != nil }
+            .sorted { $0.value < $1.value }
+            .prefix(excess)
+            .map(\.key)
+        for key in oldest {
+            tileCache.removeValue(forKey: key)
+            tileCacheRecency.removeValue(forKey: key)
         }
     }
 

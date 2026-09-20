@@ -158,6 +158,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private var currentSeed: WorldSeed?
     private var currentDimensionID: String?
     private var generator: WorldGenerator?
+    private var generationState: WorldGeneratorState?
     private var usesNativeBulkSampler = false
     private var densityCompilationMilliseconds: Double?
     private var densityCompilationBackend: String?
@@ -170,6 +171,9 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private var randomStructurePlacements: [RandomStructureRegionKey: StructurePlacementSample] = [:]
     private var emptyRandomStructureRegions: Set<RandomStructureRegionKey> = []
     private var concentricStructurePlacements: [String: [StructurePlacementSample]] = [:]
+    private var structureCacheAccess: [RandomStructureRegionKey: UInt64] = [:]
+    private var validationCacheAccess: [StructureValidationKey: UInt64] = [:]
+    private var structureCacheClock: UInt64 = 0
     private var structureHeightmapSampler: GeneratedStructureHeightmapSampler?
     private var dataPackRoot: URL?
     nonisolated var unownedExecutor: UnownedSerialExecutor {
@@ -189,6 +193,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private var currentSeed: WorldSeed?
     private var currentDimensionID: String?
     private var generator: WorldGenerator?
+    private var generationState: WorldGeneratorState?
     private var usesNativeBulkSampler = false
     private var densityCompilationMilliseconds: Double?
     private var densityCompilationBackend: String?
@@ -200,6 +205,9 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private var randomStructurePlacements: [RandomStructureRegionKey: StructurePlacementSample] = [:]
     private var emptyRandomStructureRegions: Set<RandomStructureRegionKey> = []
     private var concentricStructurePlacements: [String: [StructurePlacementSample]] = [:]
+    private var structureCacheAccess: [RandomStructureRegionKey: UInt64] = [:]
+    private var validationCacheAccess: [StructureValidationKey: UInt64] = [:]
+    private var structureCacheClock: UInt64 = 0
     private var structureHeightmapSampler: GeneratedStructureHeightmapSampler?
     private var dataPackRoot: URL?
 
@@ -269,19 +277,28 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         guard let dataPack else {
             throw BrowserAppError.message("Structure generation worker is not ready.")
         }
+        let generatorChanged = generator !== sharedGenerator.generator
         let dimensionChanged = currentDimensionID != sharedGenerator.key.dimensionID
         let seedChanged = currentSeed != sharedGenerator.key.seed
-        if dimensionChanged {
+        // Compiled samplers and heightmap samplers capture their source generator.  Clearing
+        // them when that identity changes both fixes stale-seed sampling and prevents an idle
+        // worker from retaining an obsolete density graph.
+        if generatorChanged || dimensionChanged {
             samplers.removeAll(keepingCapacity: true)
+            structureHeightmapSampler = nil
+        }
+        if dimensionChanged {
             structureSampler = nil
             validatedStructureStarts.removeAll(keepingCapacity: true)
             rejectedStructureStarts.removeAll(keepingCapacity: true)
             randomStructurePlacements.removeAll(keepingCapacity: true)
             emptyRandomStructureRegions.removeAll(keepingCapacity: true)
             concentricStructurePlacements.removeAll(keepingCapacity: true)
-            structureHeightmapSampler = nil
         }
         generator = sharedGenerator.generator
+        // DPReader's state-less APIs use mutable caches attached to the shared graph.  Give
+        // each actor/request its own state so concurrent tile workers do not contend on them.
+        generationState = try sharedGenerator.generator.makeGenerationState()
         currentDimensionID = sharedGenerator.key.dimensionID
         currentSeed = sharedGenerator.key.seed
         usesNativeBulkSampler = sharedGenerator.usesNativeBulkSampler
@@ -296,6 +313,25 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             concentricStructurePlacements.removeAll(keepingCapacity: true)
             structureHeightmapSampler = nil
         }
+    }
+
+    /// A worker's request is finished, but its reusable output storage remains valid while the
+    /// platform keeps this same generator configuration active.  The platform clears it before
+    /// replacing the configuration.
+    func finishSharedGeneratorRequest() {
+        generator = nil
+        generationState = nil
+    }
+
+    /// Retain no generator-derived objects across native generator configurations. Placement
+    /// and static-loot caches remain because they are independent of the density graph.
+    func releaseSharedGenerator() {
+        finishSharedGeneratorRequest()
+        samplers.removeAll(keepingCapacity: false)
+        structureHeightmapSampler = nil
+        usesNativeBulkSampler = false
+        densityCompilationMilliseconds = nil
+        densityCompilationBackend = nil
     }
 #endif
 
@@ -545,6 +581,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         let worldSeed = UInt64(bitPattern: seed)
         try configureGenerator(for: worldSeed, dimensionID: query.dimensionID, using: dataPack)
         guard let generator else { throw BrowserAppError.message("Structure generation worker is not ready.") }
+        let generationState = self.generationState
         let minimum = -query.radius
         let maximum = query.radius
         let minX = query.startX &+ minimum
@@ -560,7 +597,14 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 minimumSpacingBlocks: 0
             ),
             biomeSampler: { position in
-                try generator.sampleBiome(at: position, in: self.dimensionKey(for: query.dimensionID))
+                if let generationState {
+                    return try generator.sampleBiome(
+                        at: position,
+                        in: self.dimensionKey(for: query.dimensionID),
+                        using: generationState
+                    )
+                }
+                return try generator.sampleBiome(at: position, in: self.dimensionKey(for: query.dimensionID))
             }
         )?.points ?? []
         let staticallyEligibleStructureIDs = staticCandidateStructureIDs(for: structures, query: itemQuery)
@@ -755,6 +799,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                             regionZ: regionZ
                         )
                         if let sample = randomStructurePlacements[cacheKey] {
+                            touchStructureRegion(cacheKey)
                             generated.append(sample)
                             metrics.candidates += 1
                         } else if !emptyRandomStructureRegions.contains(cacheKey) {
@@ -763,10 +808,14 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                                 for: RegistryKey(referencing: descriptor.keyName)
                             ) {
                                 randomStructurePlacements[cacheKey] = sample
+                                touchStructureRegion(cacheKey)
+                                evictStructureCachesIfNeeded()
                                 generated.append(sample)
                                 metrics.candidates += 1
                             } else {
                                 emptyRandomStructureRegions.insert(cacheKey)
+                                touchStructureRegion(cacheKey)
+                                evictStructureCachesIfNeeded()
                             }
                         }
                     }
@@ -813,11 +862,13 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                     chunkZ: sample.chunkPos.z
                 )
                 let structureID: String
-                if let cached = validatedStructureStarts[validationKey] {
-                    metrics.cacheHits += 1
-                    structureID = cached
-                } else if rejectedStructureStarts.contains(validationKey) {
-                    metrics.cacheHits += 1
+                        if let cached = validatedStructureStarts[validationKey] {
+                            touchValidation(validationKey)
+                            metrics.cacheHits += 1
+                            structureID = cached
+                        } else if rejectedStructureStarts.contains(validationKey) {
+                            touchValidation(validationKey)
+                            metrics.cacheHits += 1
                     metrics.rejected += 1
                     continue
                 } else {
@@ -836,11 +887,15 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                     }
                     guard let structure = resolvedStructure else {
                         rejectedStructureStarts.insert(validationKey)
+                        touchValidation(validationKey)
+                        evictStructureCachesIfNeeded()
                         metrics.rejected += 1
                         continue
                     }
                     structureID = structure.name
                     validatedStructureStarts[validationKey] = structureID
+                    touchValidation(validationKey)
+                    evictStructureCachesIfNeeded()
                     metrics.accepted += 1
                 }
                 points.insert(StructurePoint(
@@ -907,9 +962,11 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 )
                 let structureID: String
                 if let cached = validatedStructureStarts[validationKey] {
+                    touchValidation(validationKey)
                     metrics.cacheHits += 1
                     structureID = cached
                 } else if rejectedStructureStarts.contains(validationKey) {
+                    touchValidation(validationKey)
                     metrics.cacheHits += 1
                     metrics.rejected += 1
                     continue
@@ -927,14 +984,18 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                         typeMetrics.totalMilliseconds += startValidationMilliseconds
                         metrics.byStructureType[structureID] = typeMetrics
                     }
-                    guard let structure = resolvedStructure else {
-                        rejectedStructureStarts.insert(validationKey)
-                        metrics.rejected += 1
+                guard let structure = resolvedStructure else {
+                    rejectedStructureStarts.insert(validationKey)
+                    touchValidation(validationKey)
+                    evictStructureCachesIfNeeded()
+                    metrics.rejected += 1
                         continue
                     }
-                    structureID = structure.name
-                    validatedStructureStarts[validationKey] = structureID
-                    metrics.accepted += 1
+                structureID = structure.name
+                validatedStructureStarts[validationKey] = structureID
+                touchValidation(validationKey)
+                evictStructureCachesIfNeeded()
+                metrics.accepted += 1
                 }
                 points.insert(StructurePoint(
                     setID: descriptor.keyName,
@@ -969,6 +1030,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         guard let terrainGenerator = generator else {
             throw BrowserAppError.message("Structure generation worker is not ready.")
         }
+        let generationState = self.generationState
 
         let air = BlockState(id: "minecraft:air")
         let context = StructureGenerationContext(
@@ -981,7 +1043,15 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 let coordinate = "\(chunkX),\(chunkZ)"
                 if terrainChunks[coordinate] == nil {
                     let chunk = ProtoChunk()
-                    try? terrainGenerator.generateInto(chunk, at: PosInt2D(x: chunkX, z: chunkZ))
+                    if let generationState {
+                        try? terrainGenerator.generateInto(
+                            chunk,
+                            at: PosInt2D(x: chunkX, z: chunkZ),
+                            using: generationState
+                        )
+                    } else {
+                        try? terrainGenerator.generateInto(chunk, at: PosInt2D(x: chunkX, z: chunkZ))
+                    }
                     terrainChunks[coordinate] = chunk
                 }
                 guard let chunk = terrainChunks[coordinate],
@@ -1126,6 +1196,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private func configureGenerator(for seed: WorldSeed, dimensionID: String, using dataPack: DataPack) throws {
         if currentDimensionID != dimensionID {
             generator = nil
+            generationState = nil
             currentSeed = nil
             currentDimensionID = dimensionID
             samplers.removeAll(keepingCapacity: true)
@@ -1146,6 +1217,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             if currentSeed != seed {
                 // DPReader retains compiled graphs and search trees across seed changes.
                 try generator.setWorldSeed(seed)
+                generationState = nil
                 currentSeed = seed
                 // Bulk samplers are also seed-stable compiled programs.  Their retained
                 // instances are updated by setWorldSeed; throwing them away here defeats the
@@ -1265,6 +1337,67 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private func pointIsVisible(_ point: PosInt2D, in query: StructureQuery) -> Bool {
         point.x >= query.minX && point.x <= query.maxX
             && point.z >= query.minZ && point.z <= query.maxZ
+    }
+
+    private func touchStructureRegion(_ key: RandomStructureRegionKey) {
+        structureCacheClock &+= 1
+        structureCacheAccess[key] = structureCacheClock
+    }
+
+    private func touchValidation(_ key: StructureValidationKey) {
+        structureCacheClock &+= 1
+        validationCacheAccess[key] = structureCacheClock
+    }
+
+    /// Bound the caches which are populated while validating structure placements. This keeps
+    /// nearby regions hot without retaining every region visited by a zoomed-out pan forever.
+    private func evictStructureCachesIfNeeded() {
+        if structureCacheAccess.count > 8_192 {
+            structureCacheAccess = structureCacheAccess.filter {
+                randomStructurePlacements[$0.key] != nil || emptyRandomStructureRegions.contains($0.key)
+            }
+        }
+        if validationCacheAccess.count > 8_192 {
+            validationCacheAccess = validationCacheAccess.filter {
+                validatedStructureStarts[$0.key] != nil || rejectedStructureStarts.contains($0.key)
+            }
+        }
+        let regionLimit = 2_048
+        if randomStructurePlacements.count + emptyRandomStructureRegions.count > regionLimit {
+            let excess = min(512, randomStructurePlacements.count + emptyRandomStructureRegions.count - regionLimit)
+            let oldestKeys = structureCacheAccess
+                .filter({ randomStructurePlacements[$0.key] != nil || emptyRandomStructureRegions.contains($0.key) })
+                .sorted(by: { $0.value < $1.value })
+                .prefix(excess)
+                .map(\.key)
+            for oldest in oldestKeys {
+                randomStructurePlacements.removeValue(forKey: oldest)
+                emptyRandomStructureRegions.remove(oldest)
+                structureCacheAccess.removeValue(forKey: oldest)
+            }
+        }
+
+        let validationLimit = 4_096
+        if validatedStructureStarts.count + rejectedStructureStarts.count > validationLimit {
+            let excess = min(512, validatedStructureStarts.count + rejectedStructureStarts.count - validationLimit)
+            let oldestKeys = validationCacheAccess
+                .filter({ validatedStructureStarts[$0.key] != nil || rejectedStructureStarts.contains($0.key) })
+                .sorted(by: { $0.value < $1.value })
+                .prefix(excess)
+                .map(\.key)
+            for oldest in oldestKeys {
+                validatedStructureStarts.removeValue(forKey: oldest)
+                rejectedStructureStarts.remove(oldest)
+                validationCacheAccess.removeValue(forKey: oldest)
+            }
+        }
+
+        if concentricStructurePlacements.count > 16 {
+            let excess = concentricStructurePlacements.count - 16
+            for key in concentricStructurePlacements.keys.sorted().prefix(excess) {
+                concentricStructurePlacements.removeValue(forKey: key)
+            }
+        }
     }
 
     private func makeValidationContext(
@@ -1412,7 +1545,8 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                     atY: sampleY,
                     in: dimensionKey(for: dimensionID),
                     scale: sampleScale,
-                    forceNoBaking: sampleScale == 1
+                    forceNoBaking: sampleScale == 1,
+                    using: generationState
                 ) else {
                     throw BrowserAppError.message("The overworld biome sampler returned no data.")
                 }
@@ -1530,6 +1664,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         currentSeed = nil
         currentDimensionID = nil
         generator = nil
+        generationState = nil
         usesNativeBulkSampler = false
         densityCompilationMilliseconds = nil
         densityCompilationBackend = nil

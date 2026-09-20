@@ -890,7 +890,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             currentDimensionID = dimensionID
             awaitingFirstTileForSeed = true
             mapView.currentSeed = seed
-            mapView.tiles.removeAll(keepingCapacity: true)
+            mapView.removeAllTiles()
             mapView.tileImages.removeAll(keepingCapacity: true)
             mapView.lootContainers.removeAll()
         }
@@ -954,7 +954,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         renderTimer?.invalidate()
         renderTimer = nil
         scheduler = nil
-        mapView.tiles.removeAll(keepingCapacity: true)
+            mapView.removeAllTiles()
         mapView.tileImages.removeAll(keepingCapacity: true)
         mapView.lootContainers.removeAll(keepingCapacity: true)
         completedTiles = 0

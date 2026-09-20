@@ -129,7 +129,10 @@ extension SDLMapApplication {
             case let .tile(generation, generatedTile, completed, total, elapsedMilliseconds) where generation == renderGeneration:
                 let key = SDLTileKey(seed: generatedTile.seed, sampleY: sampleY, scaleKey: generatedTile.scaleKey, tileX: generatedTile.tileX, tileZ: generatedTile.tileZ)
                 tiles[key] = generatedTile
+                tileRecencyClock &+= 1
+                tileRecency[key] = tileRecencyClock
                 installTexture(for: generatedTile, key: key, renderer: renderer)
+                evictTileCacheIfNeeded()
                 tile = generatedTile
                 pendingTileCount = max(0, total - completed)
                 biomeGenerationStatus = "Biomes: \(completed)/\(total) ready."
@@ -179,7 +182,7 @@ extension SDLMapApplication {
         generationPlatform = nil
         generationPlatformRoot = nil
         generationPlatformPackFormat = nil
-        tiles.removeAll(keepingCapacity: true)
+        removeAllTiles()
         tile = nil
         loot.removeAll(keepingCapacity: true)
         loadedBiomeIDs.removeAll(keepingCapacity: true)
@@ -238,6 +241,24 @@ extension SDLMapApplication {
         tileTextures[key] = texture
     }
 
+    func evictTileCacheIfNeeded() {
+        while tiles.count > maximumCachedTiles {
+            guard let oldest = tileRecency.min(by: { $0.value < $1.value })?.key else { break }
+            tiles.removeValue(forKey: oldest)
+            if let texture = tileTextures.removeValue(forKey: oldest) {
+                SDL_DestroyTexture(texture)
+            }
+            tileRecency.removeValue(forKey: oldest)
+        }
+    }
+
+    func removeAllTiles() {
+        tileTextures.values.forEach(SDL_DestroyTexture)
+        tileTextures.removeAll(keepingCapacity: true)
+        tiles.removeAll(keepingCapacity: true)
+        tileRecency.removeAll(keepingCapacity: true)
+    }
+
 }
 
 final class SDLGenerationResults: @unchecked Sendable {
@@ -276,4 +297,3 @@ struct SDLTileKey: Hashable {
     let tileX: Int
     let tileZ: Int
 }
-

@@ -131,7 +131,7 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
 
         let loadingRoot = try stageRootIfNeeded(rootURL: standardizedRootURL, packFormat: packFormat)
         // Decoding templates and registry graphs dominates native memory. Load one frozen pack
-        // and share it read-only; every worker still builds its own mutable WorldGenerator.
+        // and share it read-only; the fixed-seed WorldGenerator is created only on demand.
         let sharedDataPack = try SharedLoadedDataPack(rootURL: loadingRoot, decodingVersion: packFormat)
         let workers = self.workers + self.lootSearchWorkers
         let task = Task {
@@ -150,6 +150,9 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
             try await task.value
             initializedDatapack = datapack
             self.sharedDataPack = sharedDataPack
+            // A generator is backed by registries from its source pack.  Workers have just
+            // released their local references during initialization, so drop the old graph too.
+            self.sharedWorldGenerators.removeAll(keepingCapacity: false)
             initializingDatapack = nil
             initializationTask = nil
         } catch {
@@ -201,8 +204,10 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     public func generateTile(_ request: MapTileRequest) async throws -> MapTilePresentation {
         let workerIndex = await acquireWorker()
         do {
-            let sharedGenerator = try sharedWorldGenerator(seed: UInt64(bitPattern: request.seed), dimensionID: request.dimensionID)
+            try Task.checkCancellation()
+            let sharedGenerator = try await sharedWorldGenerator(seed: UInt64(bitPattern: request.seed), dimensionID: request.dimensionID)
             try await workers[workerIndex].use(sharedGenerator: sharedGenerator)
+            try Task.checkCancellation()
             let job = PendingTileJob(
                 generation: request.generation,
                 seed: UInt64(bitPattern: request.seed),
@@ -221,7 +226,7 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
                 enabledStructureSets: request.enabledStructureSets
             )
             let result = try await workers[workerIndex].generate(job)
-            releaseWorker(workerIndex)
+            await finishWorker(workerIndex)
             return MapTilePresentation(
                 generation: request.generation,
                 seed: request.seed,
@@ -240,7 +245,7 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
                 densityCompilationBackend: result.densityCompilationBackend
             )
         } catch {
-            releaseWorker(workerIndex)
+            await finishWorker(workerIndex)
             throw error
         }
     }
@@ -251,8 +256,10 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     ) async throws -> [MapLootPresentation] {
         let workerIndex = await acquireWorker()
         do {
-            let sharedGenerator = try sharedWorldGenerator(seed: UInt64(bitPattern: seed), dimensionID: "minecraft:overworld")
+            try Task.checkCancellation()
+            let sharedGenerator = try await sharedWorldGenerator(seed: UInt64(bitPattern: seed), dimensionID: "minecraft:overworld")
             try await workers[workerIndex].use(sharedGenerator: sharedGenerator)
+            try Task.checkCancellation()
             let result = try await workers[workerIndex].loot(
                 for: StructurePoint(
                     setID: structure.setID,
@@ -262,7 +269,7 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
                 ),
                 seed: UInt64(bitPattern: seed)
             )
-            releaseWorker(workerIndex)
+            await finishWorker(workerIndex)
             return result.map {
                 MapLootPresentation(
                     block: $0.block,
@@ -274,7 +281,7 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
                 )
             }
         } catch {
-            releaseWorker(workerIndex)
+            await finishWorker(workerIndex)
             throw error
         }
     }
@@ -290,13 +297,15 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     ) async throws -> [MapLootPresentation] {
         let workerIndex = await acquireLootSearchWorker()
         do {
-            let sharedGenerator = try sharedWorldGenerator(seed: UInt64(bitPattern: seed), dimensionID: query.dimensionID)
+            try Task.checkCancellation()
+            let sharedGenerator = try await sharedWorldGenerator(seed: UInt64(bitPattern: seed), dimensionID: query.dimensionID)
             try await lootSearchWorkers[workerIndex].use(sharedGenerator: sharedGenerator)
+            try Task.checkCancellation()
             let result = try await lootSearchWorkers[workerIndex].searchLoot(query, seed: seed, onProgress: onProgress)
-            releaseLootSearchWorker(workerIndex)
+            await finishLootSearchWorker(workerIndex)
             return result
         } catch {
-            releaseLootSearchWorker(workerIndex)
+            await finishLootSearchWorker(workerIndex)
             throw error
         }
     }
@@ -310,14 +319,21 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
         }
     }
 
-    private func sharedWorldGenerator(seed: WorldSeed, dimensionID: String) throws -> SharedNativeWorldGenerator {
+    private func sharedWorldGenerator(seed: WorldSeed, dimensionID: String) async throws -> SharedNativeWorldGenerator {
         guard let sharedDataPack else {
             throw BrowserAppError.message("Structure generation worker is not ready.")
         }
         let key = SharedWorldGeneratorKey(seed: seed, dimensionID: dimensionID)
         if let generator = sharedWorldGenerators[key] { return generator }
-        // Keep only the active configuration in the platform cache. Workers retain any prior
-        // generator until an already-running request completes, avoiding a reseed race.
+        // This is the write side of the shared-generator protocol. Wait until every worker has
+        // dropped generator-derived caches before replacing the configuration, so no idle
+        // worker can keep a previous density graph alive indefinitely.
+        for worker in workers {
+            await worker.releaseSharedGenerator()
+        }
+        for worker in lootSearchWorkers {
+            await worker.releaseSharedGenerator()
+        }
         sharedWorldGenerators.removeAll(keepingCapacity: true)
         let generator = try SharedNativeWorldGenerator(
             key: key,
@@ -336,6 +352,11 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
         }
     }
 
+    private func finishWorker(_ worker: Int) async {
+        await workers[worker].finishSharedGeneratorRequest()
+        releaseWorker(worker)
+    }
+
     private func acquireLootSearchWorker() async -> Int {
         if let worker = availableLootSearchWorkers.popLast() { return worker }
         return await withCheckedContinuation { lootSearchWaiters.append($0) }
@@ -347,6 +368,11 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
         } else {
             lootSearchWaiters.removeFirst().resume(returning: worker)
         }
+    }
+
+    private func finishLootSearchWorker(_ worker: Int) async {
+        await lootSearchWorkers[worker].finishSharedGeneratorRequest()
+        releaseLootSearchWorker(worker)
     }
 }
 #endif

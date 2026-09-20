@@ -20,6 +20,11 @@ extension SDLMapApplication {
         var mapClip = SDL_Rect(x: Int32(sidebarWidth), y: 0, w: Int32(mapWidth), h: Int32(mapHeight))
         SDL_RenderSetClipRect(renderer, &mapClip)
         let bpp = MapMath.tileBlocksPerPixel(for: blocksPerPixel), scale = MapMath.scaleKey(for: MapMath.tileBlocksPerPixel(for: blocksPerPixel))
+        let visibleKeys = tiles.keys.filter { $0.seed == seed && $0.sampleY == sampleY && $0.scaleKey == scale }
+        for key in visibleKeys {
+            tileRecencyClock &+= 1
+            tileRecency[key] = tileRecencyClock
+        }
         let startX = centerX - Double(mapWidth) * blocksPerPixel / 2, startZ = centerZ - Double(mapHeight) * blocksPerPixel / 2
         let side = Double(MapMath.tileSize) * bpp / blocksPerPixel
         for (key, tile) in tiles where key.seed == seed && key.sampleY == sampleY && key.scaleKey == scale {

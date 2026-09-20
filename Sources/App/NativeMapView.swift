@@ -40,6 +40,9 @@ final class NativeMapView: NSView {
     var currentScaleKey = MapMath.scaleKey(for: 1.0)
     var tiles: [NativeTileKey: MapTilePresentation] = [:]
     var tileImages: [NativeTileKey: CGImage] = [:]
+    private var tileRecency: [NativeTileKey: UInt64] = [:]
+    private var tileRecencyClock: UInt64 = 0
+    private let maximumCachedTiles = 128
     var biomeColors: [String: BiomeColor] = [:] {
         didSet { rebuildTileImages() }
     }
@@ -102,6 +105,11 @@ final class NativeMapView: NSView {
         let worldStartZ = centerZ - bounds.height * blocksPerPixel / 2.0
         let tileWorldSpan = Double(MapMath.tileSize) * tileBPP
 
+        let visibleTileKeys = tileImages.keys.filter { $0.seed == seed && $0.scaleKey == currentScaleKey }
+        for key in visibleTileKeys {
+            tileRecencyClock &+= 1
+            tileRecency[key] = tileRecencyClock
+        }
         for (key, image) in tileImages
         where key.seed == seed && key.scaleKey == currentScaleKey {
             let x = (Double(key.tileX * MapMath.tileSize) * tileBPP - worldStartX) / blocksPerPixel
@@ -124,10 +132,28 @@ final class NativeMapView: NSView {
             tileZ: tile.tileZ
         )
         tiles[key] = tile
+        tileRecencyClock &+= 1
+        tileRecency[key] = tileRecencyClock
         if let image = makeImage(for: tile) {
             tileImages[key] = image
         }
+        evictTileCacheIfNeeded()
         needsDisplay = true
+    }
+
+    func removeAllTiles() {
+        tiles.removeAll(keepingCapacity: true)
+        tileImages.removeAll(keepingCapacity: true)
+        tileRecency.removeAll(keepingCapacity: true)
+    }
+
+    private func evictTileCacheIfNeeded() {
+        while tiles.count > maximumCachedTiles {
+            guard let oldest = tileRecency.min(by: { $0.value < $1.value })?.key else { break }
+            tiles.removeValue(forKey: oldest)
+            tileImages.removeValue(forKey: oldest)
+            tileRecency.removeValue(forKey: oldest)
+        }
     }
 
     func visibleStructures() -> [MapStructurePresentation] {
