@@ -13,11 +13,14 @@ public struct MapTilePresentation: Sendable {
     public let palette: [String]
     public let biomeIndices: [UInt16]
     public let structures: [MapStructurePresentation]
+    /// `false` means the biome raster is ready but its independently scheduled marker pass has
+    /// not completed. This differs from a completed tile which simply has no starts.
+    public let structuresComplete: Bool
     public let generationMilliseconds: Double
     public let densityCompilationMilliseconds: Double?
     public let densityCompilationBackend: String?
 
-    public init(generation: Int, seed: Int64, scaleKey: Int, tileX: Int, tileZ: Int, width: Int, height: Int, palette: [String], biomeIndices: [UInt16], structures: [MapStructurePresentation], generationMilliseconds: Double, densityCompilationMilliseconds: Double? = nil, densityCompilationBackend: String? = nil) {
+    public init(generation: Int, seed: Int64, scaleKey: Int, tileX: Int, tileZ: Int, width: Int, height: Int, palette: [String], biomeIndices: [UInt16], structures: [MapStructurePresentation], structuresComplete: Bool = true, generationMilliseconds: Double, densityCompilationMilliseconds: Double? = nil, densityCompilationBackend: String? = nil) {
         self.generation = generation
         self.seed = seed
         self.scaleKey = scaleKey
@@ -28,9 +31,49 @@ public struct MapTilePresentation: Sendable {
         self.palette = palette
         self.biomeIndices = biomeIndices
         self.structures = structures
+        self.structuresComplete = structuresComplete
         self.generationMilliseconds = generationMilliseconds
         self.densityCompilationMilliseconds = densityCompilationMilliseconds
         self.densityCompilationBackend = densityCompilationBackend
+    }
+}
+
+/// Controls how a frontend schedules the two independent user-visible parts of a map tile.
+/// `parallelStructures` deliberately regenerates the small biome cache used for structure
+/// validation, so it is a useful throughput comparison rather than a presumed optimisation.
+public enum MapTileGenerationMode: String, CaseIterable, Sendable {
+    case combined
+    case deferredStructures
+    case parallelStructures
+
+    public var title: String {
+        switch self {
+        case .combined: "Combined"
+        case .deferredStructures: "Deferred structures"
+        case .parallelStructures: "Parallel (duplicate biome cache)"
+        }
+    }
+}
+
+/// Structure data for a tile is published separately when a frontend elects not to block its
+/// biome image on structure discovery.
+public struct MapTileStructuresPresentation: Sendable {
+    public let generation: Int
+    public let seed: Int64
+    public let scaleKey: Int
+    public let tileX: Int
+    public let tileZ: Int
+    public let structures: [MapStructurePresentation]
+    public let generationMilliseconds: Double
+
+    public init(generation: Int, seed: Int64, scaleKey: Int, tileX: Int, tileZ: Int, structures: [MapStructurePresentation], generationMilliseconds: Double) {
+        self.generation = generation
+        self.seed = seed
+        self.scaleKey = scaleKey
+        self.tileX = tileX
+        self.tileZ = tileZ
+        self.structures = structures
+        self.generationMilliseconds = generationMilliseconds
     }
 }
 
@@ -198,6 +241,8 @@ public protocol DapperMapPlatform: AnyObject {
 /// result; it never assumes Web Workers, Dispatch, or a particular thread implementation.
 public protocol DapperMapGenerationPlatform: Sendable {
     func generateTile(_ request: MapTileRequest) async throws -> MapTilePresentation
+    func generateBiomeTile(_ request: MapTileRequest) async throws -> MapTilePresentation
+    func generateStructures(for request: MapTileRequest) async throws -> MapTileStructuresPresentation
     func generateLoot(for structure: MapStructurePresentation, seed: Int64) async throws -> [MapLootPresentation]
     func searchLoot(_ query: LootSearchQuery, seed: Int64) async throws -> [MapLootPresentation]
     func searchLoot(_ query: LootSearchQuery, seed: Int64, onProgress: @escaping @Sendable (LootSearchProgress) -> Void) async throws -> [MapLootPresentation]

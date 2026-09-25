@@ -11,7 +11,9 @@ extension SDLMapApplication {
         SDL_GetRendererOutputSize(renderer, &outputWidth, &outputHeight)
         SDL_RenderSetScale(renderer, Float(outputWidth) / Float(mapWidth + sidebarWidth), Float(outputHeight) / Float(mapHeight))
         if needsTextureRebuild {
-            tileTextures.values.forEach(SDL_DestroyTexture); tileTextures.removeAll(keepingCapacity: true)
+            // Keep the previous texture until its replacement has uploaded.  Destroying the
+            // whole atlas first turns a transient SDL allocation/upload failure into a hole
+            // in the map.
             for (key, tile) in tiles { installTexture(for: tile, key: key, renderer: renderer) }
             needsTextureRebuild = false
         }
@@ -20,20 +22,34 @@ extension SDLMapApplication {
         var mapClip = SDL_Rect(x: Int32(sidebarWidth), y: 0, w: Int32(mapWidth), h: Int32(mapHeight))
         SDL_RenderSetClipRect(renderer, &mapClip)
         let bpp = MapMath.tileBlocksPerPixel(for: blocksPerPixel), scale = MapMath.scaleKey(for: MapMath.tileBlocksPerPixel(for: blocksPerPixel))
-        let visibleKeys = tiles.keys.filter { $0.seed == seed && $0.sampleY == sampleY && $0.scaleKey == scale }
+        let startX = centerX - Double(mapWidth) * blocksPerPixel / 2, startZ = centerZ - Double(mapHeight) * blocksPerPixel / 2
+        let span = Double(MapMath.tileSize) * bpp
+        let minTileX = Int(floor(startX / span))
+        let maxTileX = Int(floor((startX + Double(mapWidth) * blocksPerPixel - 0.0001) / span))
+        let minTileZ = Int(floor(startZ / span))
+        let maxTileZ = Int(floor((startZ + Double(mapHeight) * blocksPerPixel - 0.0001) / span))
+        let visibleKeys = tiles.keys.filter {
+            $0.seed == seed && $0.sampleY == sampleY && $0.scaleKey == scale
+                && $0.tileX >= minTileX && $0.tileX <= maxTileX
+                && $0.tileZ >= minTileZ && $0.tileZ <= maxTileZ
+        }
         for key in visibleKeys {
             tileRecencyClock &+= 1
             tileRecency[key] = tileRecencyClock
         }
-        let startX = centerX - Double(mapWidth) * blocksPerPixel / 2, startZ = centerZ - Double(mapHeight) * blocksPerPixel / 2
         let side = Double(MapMath.tileSize) * bpp / blocksPerPixel
-        for (key, tile) in tiles where key.seed == seed && key.sampleY == sampleY && key.scaleKey == scale {
+        for key in visibleKeys {
+            guard let tile = tiles[key] else { continue }
+            // A texture can be absent after a transient SDL upload failure.  Retry it when
+            // the tile is actually needed rather than leaving the cleared background visible.
+            if tileTextures[key] == nil {
+                installTexture(for: tile, key: key, renderer: renderer)
+            }
             if let texture = tileTextures[key] {
                 var destination = SDL_Rect(x: Int32(floor((Double(tile.tileX * MapMath.tileSize) * bpp - startX) / blocksPerPixel)) + Int32(sidebarWidth), y: Int32(floor((Double(tile.tileZ * MapMath.tileSize) * bpp - startZ) / blocksPerPixel)), w: Int32(ceil(side)), h: Int32(ceil(side)))
                 SDL_RenderCopy(renderer, texture, nil, &destination)
             }
         }
-        let span = Double(MapMath.tileSize) * bpp
         SDL_SetRenderDrawColor(renderer, 30, 28, 24, 45)
         for tx in Int(floor(startX / span))...Int(ceil((startX + Double(mapWidth) * blocksPerPixel) / span)) {
             let x = Int32((Double(tx) * span - startX) / blocksPerPixel) + Int32(sidebarWidth)
@@ -189,6 +205,7 @@ extension SDLMapApplication {
             paragraph("Search threads: \(lootSearchThreadCount)")
             row([("search-threads-minus", "-", lootSearchThreadCount > 1), ("search-threads-plus", "+", lootSearchThreadCount < 4)])
             row([("llvm", "LLVM: \(enableDensityCompilation ? "On" : "Off")", true)])
+            row([("tile-scheduling", "Tile scheduling: \(tileGenerationMode.title)", true)])
             row([("apply-settings", "Apply settings", true)])
             paragraph(biomeGenerationStatus + "\n" + structureGenerationStatus)
             paragraph("Cached tiles: \(tiles.count)\nPending: \(pendingTileCount)")

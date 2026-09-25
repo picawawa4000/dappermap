@@ -20,6 +20,11 @@ struct SharedWorldGeneratorKey: Hashable {
     let dimensionID: String
 }
 
+private struct SharedConcentricPlacementKey: Hashable {
+    let generatorKey: SharedWorldGeneratorKey
+    let structureSetIDs: [String]
+}
+
 /// DPReader permits concurrent generation from a fixed-seed generator when callers use distinct
 /// chunks/states. Never reseed this object: an old request can safely finish on its generator
 /// after the UI has moved to another seed.
@@ -77,6 +82,9 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     /// Search workers never service interactive tile or marker-loot requests. This keeps a
     /// potentially long radius search from consuming the map's responsive generation capacity.
     private let lootSearchWorkers: [TileGenerationService]
+    /// One service owns DPReader's concentric-ring sampler. Its output is then safe immutable
+    /// input for all tile workers, instead of making every worker locate the same strongholds.
+    private let concentricPlacementWorker: TileGenerationService
     private var availableWorkers: [Int]
     private var waiters: [CheckedContinuation<Int, Never>] = []
     private var availableLootSearchWorkers: [Int]
@@ -87,6 +95,9 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     private var stagedRoots: [String: URL] = [:]
     private var sharedDataPack: SharedLoadedDataPack?
     private var sharedWorldGenerators: [SharedWorldGeneratorKey: SharedNativeWorldGenerator] = [:]
+    private var sharedStructureCaches: SharedNativeStructureCaches?
+    private var sharedConcentricPlacements: [SharedConcentricPlacementKey: SharedConcentricPlacements] = [:]
+    private var concentricPlacementTasks: [SharedConcentricPlacementKey: Task<SharedConcentricPlacements, Error>] = [:]
 
     public init(
         threadCount: Int,
@@ -107,6 +118,10 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
         lootSearchWorkers = (0..<searchCount).map { _ in
             TileGenerationService(samplingBackend: .scalar, prefersNativeCompilation: false)
         }
+        concentricPlacementWorker = TileGenerationService(
+            samplingBackend: .scalar,
+            prefersNativeCompilation: false
+        )
         // `popLast()` should hand the first request to worker zero, the worker configured with
         // LLVM bulk sampling, rather than to the highest-index scalar fallback.
         availableWorkers = Array((0..<count).reversed())
@@ -133,7 +148,7 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
         // Decoding templates and registry graphs dominates native memory. Load one frozen pack
         // and share it read-only; the fixed-seed WorldGenerator is created only on demand.
         let sharedDataPack = try SharedLoadedDataPack(rootURL: loadingRoot, decodingVersion: packFormat)
-        let workers = self.workers + self.lootSearchWorkers
+        let workers = self.workers + self.lootSearchWorkers + [concentricPlacementWorker]
         let task = Task {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for worker in workers {
@@ -153,6 +168,9 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
             // A generator is backed by registries from its source pack.  Workers have just
             // released their local references during initialization, so drop the old graph too.
             self.sharedWorldGenerators.removeAll(keepingCapacity: false)
+            self.sharedStructureCaches = nil
+            self.sharedConcentricPlacements.removeAll(keepingCapacity: false)
+            self.concentricPlacementTasks.removeAll(keepingCapacity: false)
             initializingDatapack = nil
             initializationTask = nil
         } catch {
@@ -202,11 +220,26 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
     }
 
     public func generateTile(_ request: MapTileRequest) async throws -> MapTilePresentation {
+        try await generateTile(request, onStrongholdGeneration: nil)
+    }
+
+    public func generateTile(
+        _ request: MapTileRequest,
+        onStrongholdGeneration: (@Sendable () -> Void)?
+    ) async throws -> MapTilePresentation {
         let workerIndex = await acquireWorker()
         do {
             try Task.checkCancellation()
             let sharedGenerator = try await sharedWorldGenerator(seed: UInt64(bitPattern: request.seed), dimensionID: request.dimensionID)
-            try await workers[workerIndex].use(sharedGenerator: sharedGenerator)
+            try await workers[workerIndex].use(
+                sharedGenerator: sharedGenerator,
+                structureCaches: sharedStructureCaches
+            )
+            let concentricPlacements = try await sharedConcentricPlacements(
+                using: sharedGenerator,
+                enabledStructureSets: request.enabledStructureSets,
+                onStrongholdGeneration: onStrongholdGeneration
+            )
             try Task.checkCancellation()
             let job = PendingTileJob(
                 generation: request.generation,
@@ -225,7 +258,10 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
                 dimensionID: request.dimensionID,
                 enabledStructureSets: request.enabledStructureSets
             )
-            let result = try await workers[workerIndex].generate(job)
+            let result = try await workers[workerIndex].generate(
+                job,
+                sharedConcentricPlacements: concentricPlacements?.values
+            )
             await finishWorker(workerIndex)
             return MapTilePresentation(
                 generation: request.generation,
@@ -244,6 +280,55 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
                 densityCompilationMilliseconds: result.densityCompilationMilliseconds,
                 densityCompilationBackend: result.densityCompilationBackend
             )
+        } catch {
+            await finishWorker(workerIndex)
+            throw error
+        }
+    }
+
+    /// Raster-only counterpart to `generateTile`.  Structure discovery has its own worker
+    /// operation so frontends can publish pixels before markers are available.
+    public func generateBiomeTile(_ request: MapTileRequest) async throws -> MapTilePresentation {
+        let workerIndex = await acquireWorker()
+        do {
+            try Task.checkCancellation()
+            let sharedGenerator = try await sharedWorldGenerator(seed: UInt64(bitPattern: request.seed), dimensionID: request.dimensionID)
+            try await workers[workerIndex].use(sharedGenerator: sharedGenerator, structureCaches: sharedStructureCaches)
+            let result = try await workers[workerIndex].generateBiomeTile(request)
+            await finishWorker(workerIndex)
+            return result
+        } catch {
+            await finishWorker(workerIndex)
+            throw error
+        }
+    }
+
+    /// Marker-only counterpart to `generateTile`.  It owns a worker for the complete operation;
+    /// this makes it safe to schedule alongside raster jobs on the shared world generator.
+    public func generateStructures(for request: MapTileRequest) async throws -> MapTileStructuresPresentation {
+        try await generateStructures(for: request, onStrongholdGeneration: nil)
+    }
+
+    public func generateStructures(
+        for request: MapTileRequest,
+        onStrongholdGeneration: (@Sendable () -> Void)?
+    ) async throws -> MapTileStructuresPresentation {
+        let workerIndex = await acquireWorker()
+        do {
+            try Task.checkCancellation()
+            let sharedGenerator = try await sharedWorldGenerator(seed: UInt64(bitPattern: request.seed), dimensionID: request.dimensionID)
+            try await workers[workerIndex].use(sharedGenerator: sharedGenerator, structureCaches: sharedStructureCaches)
+            let concentricPlacements = try await sharedConcentricPlacements(
+                using: sharedGenerator,
+                enabledStructureSets: request.enabledStructureSets,
+                onStrongholdGeneration: onStrongholdGeneration
+            )
+            let result = try await workers[workerIndex].generateStructures(
+                for: request,
+                sharedConcentricPlacements: concentricPlacements?.values
+            )
+            await finishWorker(workerIndex)
+            return result
         } catch {
             await finishWorker(workerIndex)
             throw error
@@ -334,7 +419,11 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
         for worker in lootSearchWorkers {
             await worker.releaseSharedGenerator()
         }
+        await concentricPlacementWorker.releaseSharedGenerator()
         sharedWorldGenerators.removeAll(keepingCapacity: true)
+        sharedStructureCaches = SharedNativeStructureCaches()
+        sharedConcentricPlacements.removeAll(keepingCapacity: true)
+        concentricPlacementTasks.removeAll(keepingCapacity: true)
         let generator = try SharedNativeWorldGenerator(
             key: key,
             dataPack: sharedDataPack.dataPack,
@@ -342,6 +431,55 @@ public actor NativeGenerationPlatform: DapperMapGenerationPlatform {
         )
         sharedWorldGenerators[key] = generator
         return generator
+    }
+
+    private func sharedConcentricPlacements(
+        using sharedGenerator: SharedNativeWorldGenerator,
+        enabledStructureSets: Set<String>?,
+        onStrongholdGeneration: (@Sendable () -> Void)? = nil
+    ) async throws -> SharedConcentricPlacements? {
+        guard let sharedDataPack else { return nil }
+        let concentricIDs = Set<String>(sharedDataPack.structureSetDescriptors.compactMap { descriptor -> String? in
+            guard descriptor.kind == .concentricRings,
+                  enabledStructureSets?.contains(descriptor.keyName) ?? true
+            else { return nil }
+            return descriptor.keyName
+        })
+        guard !concentricIDs.isEmpty else { return nil }
+        let key = SharedConcentricPlacementKey(
+            generatorKey: sharedGenerator.key,
+            structureSetIDs: concentricIDs.sorted()
+        )
+        if let cached = sharedConcentricPlacements[key] { return cached }
+        // Signal only for a cache miss (including callers joining the one-flight task), so the
+        // UI distinguishes the expensive stronghold setup phase from ordinary marker validation.
+        if concentricIDs.contains("minecraft:strongholds") {
+            onStrongholdGeneration?()
+        }
+        if let task = concentricPlacementTasks[key] { return try await task.value }
+
+        let worker = concentricPlacementWorker
+        let task = Task<SharedConcentricPlacements, Error> {
+            try await worker.use(sharedGenerator: sharedGenerator)
+            do {
+                let placements = try await worker.sampleConcentricPlacements(for: concentricIDs)
+                await worker.finishSharedGeneratorRequest()
+                return placements
+            } catch {
+                await worker.finishSharedGeneratorRequest()
+                throw error
+            }
+        }
+        concentricPlacementTasks[key] = task
+        do {
+            let placements = try await task.value
+            sharedConcentricPlacements[key] = placements
+            concentricPlacementTasks.removeValue(forKey: key)
+            return placements
+        } catch {
+            concentricPlacementTasks.removeValue(forKey: key)
+            throw error
+        }
     }
 
     private func releaseWorker(_ worker: Int) {

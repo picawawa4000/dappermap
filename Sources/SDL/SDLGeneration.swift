@@ -28,15 +28,22 @@ extension SDLMapApplication {
         let maxTileZ = Int(floor((worldStartZ + Double(mapHeight) * blocksPerPixel - 0.0001) / span))
         let centerTileX = Int(floor(centerX / span))
         let centerTileZ = Int(floor(centerZ / span))
-        let requests = MapMath.centerFirstTileCoordinates(
+        let requests: [MapTileRequest] = MapMath.centerFirstTileCoordinates(
             minTileX: minTileX,
             maxTileX: maxTileX,
             minTileZ: minTileZ,
             maxTileZ: maxTileZ,
             centerTileX: centerTileX,
             centerTileZ: centerTileZ
-        ).map { tileX, tileZ in
-                MapTileRequest(generation: generation, seed: seed, centerX: centerX, centerZ: centerZ,
+        ).compactMap { tileX, tileZ -> MapTileRequest? in
+                let key = SDLTileKey(
+                    seed: seed, sampleY: sampleY, scaleKey: MapMath.scaleKey(for: tileBPP),
+                    tileX: tileX, tileZ: tileZ
+                )
+                if let cached = tiles[key], enabledStructureSets.isEmpty || cached.structuresComplete {
+                    return nil
+                }
+                return MapTileRequest(generation: generation, seed: seed, centerX: centerX, centerZ: centerZ,
                     blocksPerPixel: blocksPerPixel, viewportWidth: mapWidth, viewportHeight: mapHeight,
                     tileBlocksPerPixel: tileBPP, tileX: tileX, tileZ: tileZ, sampleY: sampleY,
                     enabledStructureSets: nil)
@@ -75,6 +82,7 @@ extension SDLMapApplication {
         }
         let results = generationResults
         let startedAt = Date()
+        let tileGenerationMode = tileGenerationMode
         generationTask = Task.detached {
             do {
                 results.store(.progress(generation: generation, message: "Preparing world generator…", elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000))
@@ -83,12 +91,17 @@ extension SDLMapApplication {
                 try Task.checkCancellation()
                 results.store(.registry(generation: generation, biomes: registry.biomes, structures: registry.structures))
                 results.store(.progress(generation: generation, message: "Generating centre tiles first…", elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000))
-                try await withThrowingTaskGroup(of: MapTilePresentation.self) { group in
+                if tileGenerationMode == .combined {
+                    try await withThrowingTaskGroup(of: MapTilePresentation.self) { group in
                     var nextRequest = 0
                     for _ in 0..<min(workers, requests.count) {
                         let request = requests[nextRequest]
                         nextRequest += 1
-                        group.addTask { try await platform.generateTile(request) }
+                        group.addTask {
+                            try await platform.generateTile(request) {
+                                results.store(.strongholds(generation: generation))
+                            }
+                        }
                     }
                     var completed = 0
                     for try await tile in group {
@@ -96,7 +109,11 @@ extension SDLMapApplication {
                         if nextRequest < requests.count {
                             let request = requests[nextRequest]
                             nextRequest += 1
-                            group.addTask { try await platform.generateTile(request) }
+                            group.addTask {
+                                try await platform.generateTile(request) {
+                                    results.store(.strongholds(generation: generation))
+                                }
+                            }
                         }
                         completed += 1
                         results.store(.tile(
@@ -106,6 +123,54 @@ extension SDLMapApplication {
                             total: requests.count,
                             elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000
                         ))
+                    }
+                    }
+                } else {
+                    await withTaskGroup(of: SDLTileWorkResult.self) { group in
+                        for request in requests {
+                            group.addTask {
+                                do { return .biome(.success(try await platform.generateBiomeTile(request))) }
+                                catch { return .biome(.failure(error)) }
+                            }
+                            // `nil` deliberately means the service's default set selection, not
+                            // "no structures". SDL uses it while its registry is loading.
+                            if tileGenerationMode == .parallelStructures, request.enabledStructureSets?.isEmpty != true {
+                                group.addTask {
+                                    do {
+                                        return .structures(.success(try await platform.generateStructures(for: request) {
+                                            results.store(.strongholds(generation: generation))
+                                        }))
+                                    }
+                                    catch { return .structures(.failure(error)) }
+                                }
+                            }
+                        }
+                        var completedBiomes = 0
+                        var completedStructures = 0
+                        for await result in group {
+                            switch result {
+                            case .biome(.success(let tile)):
+                                completedBiomes += 1
+                                results.store(.biomeTile(generation: generation, tile: tile, completed: completedBiomes, total: requests.count, elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000))
+                                if tileGenerationMode == .deferredStructures,
+                                   requests.first(where: { $0.tileX == tile.tileX && $0.tileZ == tile.tileZ })?.enabledStructureSets?.isEmpty != true,
+                                   let request = requests.first(where: { $0.tileX == tile.tileX && $0.tileZ == tile.tileZ }) {
+                                    group.addTask {
+                                        do {
+                                            return .structures(.success(try await platform.generateStructures(for: request) {
+                                                results.store(.strongholds(generation: generation))
+                                            }))
+                                        }
+                                        catch { return .structures(.failure(error)) }
+                                    }
+                                }
+                            case .structures(.success(let structures)):
+                                completedStructures += 1
+                                results.store(.tileStructures(generation: generation, structures: structures, completed: completedStructures, total: requests.count, elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000))
+                            case .biome(.failure(let error)), .structures(.failure(let error)):
+                                results.store(.failure(generation: generation, message: "Generation failed: \(error)"))
+                            }
+                        }
                     }
                 }
                 results.store(.finished(generation: generation, elapsedMilliseconds: Date().timeIntervalSince(startedAt) * 1_000))
@@ -126,9 +191,12 @@ extension SDLMapApplication {
                 loadedStructureIDs = structures
             case let .progress(generation, message, elapsedMilliseconds) where generation == renderGeneration:
                 status = "\(message) Setup \(formatDuration(elapsedMilliseconds))."
+            case let .strongholds(generation) where generation == renderGeneration:
+                structureGenerationStatus = "Generating strongholds…"
             case let .tile(generation, generatedTile, completed, total, elapsedMilliseconds) where generation == renderGeneration:
                 let key = SDLTileKey(seed: generatedTile.seed, sampleY: sampleY, scaleKey: generatedTile.scaleKey, tileX: generatedTile.tileX, tileZ: generatedTile.tileZ)
                 tiles[key] = generatedTile
+                structureMarkerTileRevision &+= 1
                 tileRecencyClock &+= 1
                 tileRecency[key] = tileRecencyClock
                 installTexture(for: generatedTile, key: key, renderer: renderer)
@@ -143,6 +211,25 @@ extension SDLMapApplication {
                     generatedTile.densityCompilationBackend.map { " \($0) compile \(formatDuration(milliseconds))." }
                 } ?? ""
                 status = "\(completed)/\(total) tiles. View \(formatDuration(elapsedMilliseconds)); tile \(formatDuration(generatedTile.generationMilliseconds)).\(compilation)"
+            case let .biomeTile(generation, generatedTile, completed, total, elapsedMilliseconds) where generation == renderGeneration:
+                let key = SDLTileKey(seed: generatedTile.seed, sampleY: sampleY, scaleKey: generatedTile.scaleKey, tileX: generatedTile.tileX, tileZ: generatedTile.tileZ)
+                tiles[key] = generatedTile
+                structureMarkerTileRevision &+= 1
+                tileRecencyClock &+= 1
+                tileRecency[key] = tileRecencyClock
+                installTexture(for: generatedTile, key: key, renderer: renderer)
+                evictTileCacheIfNeeded()
+                tile = generatedTile
+                pendingTileCount = max(0, total - completed)
+                biomeGenerationStatus = "Biomes: \(completed)/\(total) ready."
+                structureGenerationStatus = enabledStructureSets.isEmpty ? "Structures: disabled." : structureGenerationStatus
+                status = "\(completed)/\(total) biome tiles. View \(formatDuration(elapsedMilliseconds)); tile \(formatDuration(generatedTile.generationMilliseconds))."
+                if let structures = deferredStructureResults.removeValue(forKey: key) {
+                    install(structures: structures)
+                }
+            case let .tileStructures(generation, structures, completed, total, _) where generation == renderGeneration:
+                install(structures: structures)
+                structureGenerationStatus = "Structures: \(completed)/\(total) ready."
             case let .finished(generation, elapsedMilliseconds) where generation == renderGeneration:
                 pendingTileCount = 0
                 status = "Rendered \(formatDuration(elapsedMilliseconds)) total."
@@ -172,7 +259,33 @@ extension SDLMapApplication {
         }
     }
 
+    private func install(structures: MapTileStructuresPresentation) {
+        let key = SDLTileKey(seed: structures.seed, sampleY: sampleY, scaleKey: structures.scaleKey, tileX: structures.tileX, tileZ: structures.tileZ)
+        // A previous viewport generation may still have a raster for this coordinate. Do not
+        // merge a new marker result into it: the later biome result would overwrite the markers.
+        guard let existing = tiles[key], existing.generation == structures.generation else {
+            deferredStructureResults[key] = structures
+            return
+        }
+        let updated = MapTilePresentation(
+            generation: existing.generation, seed: existing.seed, scaleKey: existing.scaleKey,
+            tileX: existing.tileX, tileZ: existing.tileZ, width: existing.width, height: existing.height,
+            palette: existing.palette, biomeIndices: existing.biomeIndices, structures: structures.structures,
+            structuresComplete: true,
+            generationMilliseconds: existing.generationMilliseconds,
+            densityCompilationMilliseconds: existing.densityCompilationMilliseconds,
+            densityCompilationBackend: existing.densityCompilationBackend
+        )
+        tiles[key] = updated
+        structureMarkerTileRevision &+= 1
+        tile = updated
+    }
+
     func changeDatapackVersion(by offset: Int) {
+        // Version controls can be activated while the seed editor still owns a snapshot (most
+        // commonly Paste followed immediately by a version change during startup). Commit it
+        // here rather than relying on the preceding mouse event to have blurred the editor.
+        blur()
         guard let index = vanillaDatapacks.firstIndex(of: selectedDatapack) else { return }
         let nextIndex = min(max(0, index + offset), vanillaDatapacks.count - 1)
         guard nextIndex != index else { return }
@@ -220,7 +333,6 @@ extension SDLMapApplication {
     }
 
     func installTexture(for tile: MapTilePresentation, key: SDLTileKey, renderer: OpaquePointer) {
-        if let old = tileTextures.removeValue(forKey: key) { SDL_DestroyTexture(old) }
         guard let texture = SDL_CreateTexture(
             renderer, SDL_PIXELFORMAT_RGBA32.rawValue, Int32(SDL_TEXTUREACCESS_STATIC.rawValue),
             Int32(tile.width), Int32(tile.height)
@@ -238,13 +350,18 @@ extension SDLMapApplication {
             return
         }
         SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_NONE)
-        tileTextures[key] = texture
+        // Replace atomically from the cache's perspective: retaining the old texture on a
+        // failed allocation or upload prevents blank tile-sized gaps during a rebuild.
+        if let old = tileTextures.updateValue(texture, forKey: key) {
+            SDL_DestroyTexture(old)
+        }
     }
 
     func evictTileCacheIfNeeded() {
         while tiles.count > maximumCachedTiles {
             guard let oldest = tileRecency.min(by: { $0.value < $1.value })?.key else { break }
             tiles.removeValue(forKey: oldest)
+            structureMarkerTileRevision &+= 1
             if let texture = tileTextures.removeValue(forKey: oldest) {
                 SDL_DestroyTexture(texture)
             }
@@ -257,6 +374,9 @@ extension SDLMapApplication {
         tileTextures.removeAll(keepingCapacity: true)
         tiles.removeAll(keepingCapacity: true)
         tileRecency.removeAll(keepingCapacity: true)
+        structureMarkerTileRevision &+= 1
+        structureMarkerCacheKey = nil
+        structureMarkerCache.removeAll(keepingCapacity: true)
     }
 
 }
@@ -265,7 +385,10 @@ final class SDLGenerationResults: @unchecked Sendable {
     enum Result {
         case registry(generation: Int, biomes: [String], structures: [String])
         case progress(generation: Int, message: String, elapsedMilliseconds: Double)
+        case strongholds(generation: Int)
         case tile(generation: Int, tile: MapTilePresentation, completed: Int, total: Int, elapsedMilliseconds: Double)
+        case biomeTile(generation: Int, tile: MapTilePresentation, completed: Int, total: Int, elapsedMilliseconds: Double)
+        case tileStructures(generation: Int, structures: MapTileStructuresPresentation, completed: Int, total: Int, elapsedMilliseconds: Double)
         case finished(generation: Int, elapsedMilliseconds: Double)
         case loot(request: Int, containers: [MapLootPresentation], message: String)
         case searchProgress(request: Int, progress: LootSearchProgress)
@@ -288,6 +411,11 @@ final class SDLGenerationResults: @unchecked Sendable {
         guard !results.isEmpty else { return nil }
         return results.removeFirst()
     }
+}
+
+private enum SDLTileWorkResult: Sendable {
+    case biome(Result<MapTilePresentation, Error>)
+    case structures(Result<MapTileStructuresPresentation, Error>)
 }
 
 struct SDLTileKey: Hashable {

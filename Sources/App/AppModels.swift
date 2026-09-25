@@ -59,6 +59,14 @@ let runtimeDatapackPath = "./.dappermap/runtime"
 public enum MapMath {
     public static let tileSize = 256
 
+    /// Accept signed decimal seeds and the full unsigned 64-bit bit pattern used by Minecraft
+    /// tooling, while preserving one representation across all frontends.
+    public static func parseWorldSeed(_ raw: String) -> Int64? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let signed = Int64(value) { return signed }
+        return UInt64(value).map(Int64.init(bitPattern:))
+    }
+
     public static func scaleKey(for blocksPerPixel: Double) -> Int {
         Int((max(0.125, blocksPerPixel) * 1024.0).rounded())
     }

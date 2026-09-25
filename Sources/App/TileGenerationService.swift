@@ -136,6 +136,99 @@ final class SharedLoadedDataPack: @unchecked Sendable {
     }
 }
 
+/// DPReader's placement samples are immutable after construction, but their public types are not
+/// yet Sendable. This is the narrow hand-off used by native actors after a single-flight ring
+/// calculation; consumers only read the dictionary.
+final class SharedConcentricPlacements: @unchecked Sendable {
+    let values: [String: [StructurePlacementSample]]
+
+    init(_ values: [String: [StructurePlacementSample]]) {
+        self.values = values
+    }
+}
+
+enum SharedRandomStructurePlacement {
+    case placement(StructurePlacementSample)
+    case empty
+}
+
+enum SharedStructureStartValidation {
+    case accepted(String)
+    case rejected
+}
+
+/// A seed/dimension-scoped cache shared by native tile actors. Values are immutable DPReader
+/// samples and resolved IDs; the lock covers only dictionary/LRU bookkeeping, never generation
+/// or terrain validation. The platform discards this object before changing world configuration.
+final class SharedNativeStructureCaches: @unchecked Sendable {
+    private let lock = NSLock()
+    private var randomPlacements: [RandomStructureRegionKey: SharedRandomStructurePlacement] = [:]
+    private var validations: [StructureValidationKey: SharedStructureStartValidation] = [:]
+    private var randomAccess: [RandomStructureRegionKey: UInt64] = [:]
+    private var validationAccess: [StructureValidationKey: UInt64] = [:]
+    private var clock: UInt64 = 0
+
+    func randomPlacement(for key: RandomStructureRegionKey) -> SharedRandomStructurePlacement? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let result = randomPlacements[key] else { return nil }
+        clock &+= 1
+        randomAccess[key] = clock
+        return result
+    }
+
+    func storeRandomPlacement(_ placement: SharedRandomStructurePlacement, for key: RandomStructureRegionKey) {
+        lock.lock()
+        defer { lock.unlock() }
+        randomPlacements[key] = placement
+        clock &+= 1
+        randomAccess[key] = clock
+        evictRandomPlacementsIfNeeded()
+    }
+
+    func validation(for key: StructureValidationKey) -> SharedStructureStartValidation? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let result = validations[key] else { return nil }
+        clock &+= 1
+        validationAccess[key] = clock
+        return result
+    }
+
+    func storeValidation(_ validation: SharedStructureStartValidation, for key: StructureValidationKey) {
+        lock.lock()
+        defer { lock.unlock() }
+        validations[key] = validation
+        clock &+= 1
+        validationAccess[key] = clock
+        evictValidationsIfNeeded()
+    }
+
+    private func evictRandomPlacementsIfNeeded() {
+        let limit = 8_192
+        guard randomPlacements.count > limit + 512 else { return }
+        let oldest = randomAccess.sorted { $0.value < $1.value }
+            .prefix(randomPlacements.count - limit)
+            .map(\.key)
+        for key in oldest {
+            randomPlacements.removeValue(forKey: key)
+            randomAccess.removeValue(forKey: key)
+        }
+    }
+
+    private func evictValidationsIfNeeded() {
+        let limit = 8_192
+        guard validations.count > limit + 512 else { return }
+        let oldest = validationAccess.sorted { $0.value < $1.value }
+            .prefix(validations.count - limit)
+            .map(\.key)
+        for key in oldest {
+            validations.removeValue(forKey: key)
+            validationAccess.removeValue(forKey: key)
+        }
+    }
+}
+
 /// Owns one non-thread-safe DPReader generation context. Platforms choose how instances are
 /// scheduled: the browser pins one to a Web Worker; native keeps one actor per requested thread.
 actor TileGenerationService: DapperMapGenerationPlatform {
@@ -176,6 +269,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private var structureCacheClock: UInt64 = 0
     private var structureHeightmapSampler: GeneratedStructureHeightmapSampler?
     private var dataPackRoot: URL?
+    private var sharedNativeStructureCaches: SharedNativeStructureCaches?
     nonisolated var unownedExecutor: UnownedSerialExecutor {
         serialExecutor.unownedExecutor
     }
@@ -210,6 +304,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
     private var structureCacheClock: UInt64 = 0
     private var structureHeightmapSampler: GeneratedStructureHeightmapSampler?
     private var dataPackRoot: URL?
+    private var sharedNativeStructureCaches: SharedNativeStructureCaches?
 
     init(samplingBackend: TileSamplingBackend = .scalar, prefersNativeCompilation: Bool = true) {
         self.samplingBackend = samplingBackend
@@ -273,7 +368,10 @@ actor TileGenerationService: DapperMapGenerationPlatform {
 #if !os(WASI)
     /// Installs a fixed-seed shared generator for one native request. The service remains actor
     /// isolated, so placement samplers and all local caches are never shared between workers.
-    func use(sharedGenerator: SharedNativeWorldGenerator) throws {
+    func use(
+        sharedGenerator: SharedNativeWorldGenerator,
+        structureCaches: SharedNativeStructureCaches? = nil
+    ) throws {
         guard let dataPack else {
             throw BrowserAppError.message("Structure generation worker is not ready.")
         }
@@ -304,6 +402,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         usesNativeBulkSampler = sharedGenerator.usesNativeBulkSampler
         densityCompilationMilliseconds = sharedGenerator.densityCompilationMilliseconds
         densityCompilationBackend = sharedGenerator.densityCompilationBackend
+        sharedNativeStructureCaches = structureCaches
         if dimensionChanged || seedChanged || structureSampler == nil {
             structureSampler = StructurePlacementSampler(withWorldSeed: sharedGenerator.key.seed, usingDataPacks: [dataPack])
             validatedStructureStarts.removeAll(keepingCapacity: true)
@@ -332,6 +431,7 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         usesNativeBulkSampler = false
         densityCompilationMilliseconds = nil
         densityCompilationBackend = nil
+        sharedNativeStructureCaches = nil
     }
 #endif
 
@@ -451,11 +551,18 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         )
     }
 
-    func generate(_ job: PendingTileJob) throws -> GeneratedTile {
+    func generate(
+        _ job: PendingTileJob,
+        sharedConcentricPlacements: [String: [StructurePlacementSample]]? = nil
+    ) throws -> GeneratedTile {
         let start = Date()
         let generated = try generateBiomeTile(job)
         guard let biomeCache = generated.biomeCache else { return generated }
-        let structures = try generateStructures(for: job, biomeCache: biomeCache)
+        let structures = try generateStructures(
+            for: job,
+            biomeCache: biomeCache,
+            sharedConcentricPlacements: sharedConcentricPlacements
+        )
         let tile = CachedTile(
             width: generated.tile.width,
             height: generated.tile.height,
@@ -475,7 +582,8 @@ actor TileGenerationService: DapperMapGenerationPlatform {
 
     func generateStructures(
         for job: PendingTileJob,
-        biomeCache: TileBiomeCache
+        biomeCache: TileBiomeCache,
+        sharedConcentricPlacements: [String: [StructurePlacementSample]]? = nil
     ) throws -> StructureQueryResult? {
         try Task.checkCancellation()
         let structureQuery = StructureQuery(
@@ -491,8 +599,30 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         guard !structureQuery.enabledStructureSets.isEmpty else { return nil }
         return try structures(
             in: structureQuery,
-            biomeSampler: biomeCache.biome(at:)
+            biomeSampler: biomeCache.biome(at:),
+            sharedConcentricPlacements: sharedConcentricPlacements
         )
+    }
+
+    /// Computes the costly biome-adjusted positions for concentric-ring sets. Native callers
+    /// invoke this on one dedicated service and distribute the immutable result to tile workers.
+    /// `StructurePlacementSampler` currently owns an internal biome generator for this operation,
+    /// so centralising it also prevents one such generator per concurrent tile worker.
+    func sampleConcentricPlacements(
+        for structureSetIDs: Set<String>
+    ) throws -> SharedConcentricPlacements {
+        guard let structureSampler else {
+            throw BrowserAppError.message("Structure generation worker is not ready.")
+        }
+        var placements: [String: [StructurePlacementSample]] = [:]
+        placements.reserveCapacity(structureSetIDs.count)
+        for structureSetID in structureSetIDs.sorted() {
+            try Task.checkCancellation()
+            placements[structureSetID] = try structureSampler.sampleAllPlacements(
+                for: RegistryKey(referencing: structureSetID)
+            )
+        }
+        return SharedConcentricPlacements(placements)
     }
 
     func generateTile(_ request: MapTileRequest) async throws -> MapTilePresentation {
@@ -529,6 +659,71 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             generationMilliseconds: result.generationMilliseconds,
             densityCompilationMilliseconds: result.densityCompilationMilliseconds,
             densityCompilationBackend: result.densityCompilationBackend
+        )
+    }
+
+    /// Produces only the paintable tile.  The returned image intentionally has no markers;
+    /// callers that use split scheduling publish the marker pass separately.
+    func generateBiomeTile(_ request: MapTileRequest) async throws -> MapTilePresentation {
+        let result = try generateBiomeTile(PendingTileJob(
+            generation: request.generation,
+            seed: UInt64(bitPattern: request.seed),
+            viewState: ViewState(centerX: request.centerX, centerZ: request.centerZ, blocksPerPixel: request.blocksPerPixel, viewportWidth: request.viewportWidth, viewportHeight: request.viewportHeight),
+            tileBlocksPerPixel: request.tileBlocksPerPixel,
+            tileX: request.tileX,
+            tileZ: request.tileZ,
+            sampleY: request.sampleY,
+            dimensionID: request.dimensionID,
+            enabledStructureSets: request.enabledStructureSets
+        ))
+        return MapTilePresentation(
+            generation: request.generation, seed: request.seed,
+            scaleKey: MapMath.scaleKey(for: request.tileBlocksPerPixel), tileX: request.tileX, tileZ: request.tileZ,
+            width: result.tile.width, height: result.tile.height, palette: result.tile.palette,
+            biomeIndices: result.tile.biomeIndices, structures: [], structuresComplete: false, generationMilliseconds: result.generationMilliseconds,
+            densityCompilationMilliseconds: result.densityCompilationMilliseconds,
+            densityCompilationBackend: result.densityCompilationBackend
+        )
+    }
+
+    /// This intentionally creates its own biome cache.  It permits structure work to run in
+    /// parallel with rasterisation without sharing a non-Sendable generator/cache between actors.
+    func generateStructures(for request: MapTileRequest) async throws -> MapTileStructuresPresentation {
+        try await generateStructures(for: request, sharedConcentricPlacements: nil)
+    }
+
+    func generateStructures(
+        for request: MapTileRequest,
+        sharedConcentricPlacements: [String: [StructurePlacementSample]]? = nil
+    ) async throws -> MapTileStructuresPresentation {
+        let start = Date()
+        let job = PendingTileJob(
+            generation: request.generation,
+            seed: UInt64(bitPattern: request.seed),
+            viewState: ViewState(centerX: request.centerX, centerZ: request.centerZ, blocksPerPixel: request.blocksPerPixel, viewportWidth: request.viewportWidth, viewportHeight: request.viewportHeight),
+            tileBlocksPerPixel: request.tileBlocksPerPixel,
+            tileX: request.tileX,
+            tileZ: request.tileZ,
+            sampleY: request.sampleY,
+            dimensionID: request.dimensionID,
+            enabledStructureSets: request.enabledStructureSets
+        )
+        let biome = try generateBiomeTile(job)
+        let structures: StructureQueryResult?
+        if let biomeCache = biome.biomeCache {
+            structures = try generateStructures(
+                for: job,
+                biomeCache: biomeCache,
+                sharedConcentricPlacements: sharedConcentricPlacements
+            )
+        } else {
+            structures = nil
+        }
+        return MapTileStructuresPresentation(
+            generation: request.generation, seed: request.seed,
+            scaleKey: MapMath.scaleKey(for: request.tileBlocksPerPixel), tileX: request.tileX, tileZ: request.tileZ,
+            structures: structures?.points.map { MapStructurePresentation(setID: $0.setID, structureID: $0.structureID, x: $0.x, z: $0.z) } ?? [],
+            generationMilliseconds: Date().timeIntervalSince(start) * 1_000
         )
     }
 
@@ -744,7 +939,8 @@ actor TileGenerationService: DapperMapGenerationPlatform {
 
     func structures(
         in query: StructureQuery,
-        biomeSampler: @escaping (PosInt3D) throws -> RegistryKey<Biome>?
+        biomeSampler: @escaping (PosInt3D) throws -> RegistryKey<Biome>?,
+        sharedConcentricPlacements: [String: [StructurePlacementSample]]? = nil
     ) throws -> StructureQueryResult? {
         let profilingStart = Date()
         var metrics = StructureProfilingMetrics()
@@ -762,6 +958,14 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         var points = Set<StructurePoint>()
         for descriptor in structureSetDescriptors where query.enabledStructureSets.contains(descriptor.keyName) {
             try Task.checkCancellation()
+            let structureSetKey = RegistryKey<StructureSet>(referencing: descriptor.keyName)
+            // Structure sets are global registry entries, but many belong exclusively to another
+            // dimension. DPReader caches this eligibility analysis, letting us avoid sampling
+            // regions and validating starts which can never be shown in this view.
+            guard try structureSampler.structureSetCanGenerate(
+                structureSetKey,
+                in: dimensionKey(for: query.dimensionID)
+            ) else { continue }
             let samples: [StructurePlacementSample]
             switch descriptor.kind {
             case .randomSpread:
@@ -803,17 +1007,30 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                             generated.append(sample)
                             metrics.candidates += 1
                         } else if !emptyRandomStructureRegions.contains(cacheKey) {
-                            if let sample = try structureSampler.sampleStructureSet(
+                            if let shared = sharedNativeStructureCaches?.randomPlacement(for: cacheKey) {
+                                switch shared {
+                                case let .placement(sample):
+                                    randomStructurePlacements[cacheKey] = sample
+                                    touchStructureRegion(cacheKey)
+                                    generated.append(sample)
+                                    metrics.candidates += 1
+                                case .empty:
+                                    emptyRandomStructureRegions.insert(cacheKey)
+                                    touchStructureRegion(cacheKey)
+                                }
+                            } else if let sample = try structureSampler.sampleStructureSet(
                                 inRegion: PosInt2D(x: regionX, z: regionZ),
-                                for: RegistryKey(referencing: descriptor.keyName)
+                                for: structureSetKey
                             ) {
                                 randomStructurePlacements[cacheKey] = sample
+                                sharedNativeStructureCaches?.storeRandomPlacement(.placement(sample), for: cacheKey)
                                 touchStructureRegion(cacheKey)
                                 evictStructureCachesIfNeeded()
                                 generated.append(sample)
                                 metrics.candidates += 1
                             } else {
                                 emptyRandomStructureRegions.insert(cacheKey)
+                                sharedNativeStructureCaches?.storeRandomPlacement(.empty, for: cacheKey)
                                 touchStructureRegion(cacheKey)
                                 evictStructureCachesIfNeeded()
                             }
@@ -827,7 +1044,9 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                 // spread placements so strongholds are retained in the tile cache and use the
                 // already-generated biome sampler for validation.
                 let samplingStart = Date()
-                if let cached = concentricStructurePlacements[descriptor.keyName] {
+                if let shared = sharedConcentricPlacements?[descriptor.keyName] {
+                    samples = shared
+                } else if let cached = concentricStructurePlacements[descriptor.keyName] {
                     samples = cached
                 } else {
                     let generated = try structureSampler.sampleAllPlacements(
@@ -970,6 +1189,20 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                     metrics.cacheHits += 1
                     metrics.rejected += 1
                     continue
+                } else if let shared = sharedNativeStructureCaches?.validation(for: validationKey) {
+                    switch shared {
+                    case let .accepted(cached):
+                        validatedStructureStarts[validationKey] = cached
+                        touchValidation(validationKey)
+                        metrics.cacheHits += 1
+                        structureID = cached
+                    case .rejected:
+                        rejectedStructureStarts.insert(validationKey)
+                        touchValidation(validationKey)
+                        metrics.cacheHits += 1
+                        metrics.rejected += 1
+                        continue
+                    }
                 } else {
                     let startValidationStart = Date()
                     let resolvedStructure = try structureSampler.resolveStructure(
@@ -984,15 +1217,17 @@ actor TileGenerationService: DapperMapGenerationPlatform {
                         typeMetrics.totalMilliseconds += startValidationMilliseconds
                         metrics.byStructureType[structureID] = typeMetrics
                     }
-                guard let structure = resolvedStructure else {
-                    rejectedStructureStarts.insert(validationKey)
+                    guard let structure = resolvedStructure else {
+                        rejectedStructureStarts.insert(validationKey)
+                        sharedNativeStructureCaches?.storeValidation(.rejected, for: validationKey)
                     touchValidation(validationKey)
                     evictStructureCachesIfNeeded()
                     metrics.rejected += 1
                         continue
                     }
-                structureID = structure.name
-                validatedStructureStarts[validationKey] = structureID
+                    structureID = structure.name
+                    validatedStructureStarts[validationKey] = structureID
+                    sharedNativeStructureCaches?.storeValidation(.accepted(structureID), for: validationKey)
                 touchValidation(validationKey)
                 evictStructureCachesIfNeeded()
                 metrics.accepted += 1
@@ -1363,8 +1598,11 @@ actor TileGenerationService: DapperMapGenerationPlatform {
             }
         }
         let regionLimit = 2_048
-        if randomStructurePlacements.count + emptyRandomStructureRegions.count > regionLimit {
-            let excess = min(512, randomStructurePlacements.count + emptyRandomStructureRegions.count - regionLimit)
+        // Evict in batches.  Evicting at `limit + 1` used to sort the whole cache for every
+        // new region after it filled, turning a bounded cache into a steady CPU hotspot.
+        let regionHighWater = regionLimit + 512
+        if randomStructurePlacements.count + emptyRandomStructureRegions.count > regionHighWater {
+            let excess = randomStructurePlacements.count + emptyRandomStructureRegions.count - regionLimit
             let oldestKeys = structureCacheAccess
                 .filter({ randomStructurePlacements[$0.key] != nil || emptyRandomStructureRegions.contains($0.key) })
                 .sorted(by: { $0.value < $1.value })
@@ -1378,8 +1616,9 @@ actor TileGenerationService: DapperMapGenerationPlatform {
         }
 
         let validationLimit = 4_096
-        if validatedStructureStarts.count + rejectedStructureStarts.count > validationLimit {
-            let excess = min(512, validatedStructureStarts.count + rejectedStructureStarts.count - validationLimit)
+        let validationHighWater = validationLimit + 512
+        if validatedStructureStarts.count + rejectedStructureStarts.count > validationHighWater {
+            let excess = validatedStructureStarts.count + rejectedStructureStarts.count - validationLimit
             let oldestKeys = validationCacheAccess
                 .filter({ validatedStructureStarts[$0.key] != nil || rejectedStructureStarts.contains($0.key) })
                 .sorted(by: { $0.value < $1.value })

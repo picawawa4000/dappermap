@@ -2512,11 +2512,8 @@ final class BrowserApp: DapperMapPlatform {
     }
 
     private func parseSeed(_ raw: String) -> WorldSeed? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let signed = Int64(trimmed) {
-            return UInt64(bitPattern: signed)
-        }
-        return UInt64(trimmed)
+        guard let seed = MapMath.parseWorldSeed(raw) else { return nil }
+        return UInt64(bitPattern: seed)
     }
 
     private func displaySeed(_ seed: WorldSeed) -> String {

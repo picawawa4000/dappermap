@@ -30,6 +30,13 @@ struct NativeTileKey: Hashable {
     let tileZ: Int
 }
 
+private struct NativeStructureMarkerCacheKey: Hashable {
+    let seed: Int64?
+    let scaleKey: Int
+    let enabledStructureSets: Set<String>
+    let tileRevision: UInt64
+}
+
 @MainActor
 final class NativeMapView: NSView {
     weak var delegate: NativeMapViewDelegate?
@@ -42,6 +49,9 @@ final class NativeMapView: NSView {
     var tileImages: [NativeTileKey: CGImage] = [:]
     private var tileRecency: [NativeTileKey: UInt64] = [:]
     private var tileRecencyClock: UInt64 = 0
+    private var structureMarkerTileRevision: UInt64 = 0
+    private var structureMarkerCacheKey: NativeStructureMarkerCacheKey?
+    private var structureMarkerCache: [MapStructurePresentation] = []
     private let maximumCachedTiles = 128
     var biomeColors: [String: BiomeColor] = [:] {
         didSet { rebuildTileImages() }
@@ -50,7 +60,10 @@ final class NativeMapView: NSView {
         didSet { needsDisplay = true }
     }
     var enabledStructureSets: Set<String> = [] {
-        didSet { needsDisplay = true }
+        didSet {
+            invalidateStructureMarkerCache()
+            needsDisplay = true
+        }
     }
     var lootContainers: [MapLootPresentation] = []
     var tooltip: MapTooltipPresentation?
@@ -105,7 +118,15 @@ final class NativeMapView: NSView {
         let worldStartZ = centerZ - bounds.height * blocksPerPixel / 2.0
         let tileWorldSpan = Double(MapMath.tileSize) * tileBPP
 
-        let visibleTileKeys = tileImages.keys.filter { $0.seed == seed && $0.scaleKey == currentScaleKey }
+        let minTileX = Int(floor(worldStartX / tileWorldSpan))
+        let maxTileX = Int(floor((worldStartX + bounds.width * blocksPerPixel - 0.0001) / tileWorldSpan))
+        let minTileZ = Int(floor(worldStartZ / tileWorldSpan))
+        let maxTileZ = Int(floor((worldStartZ + bounds.height * blocksPerPixel - 0.0001) / tileWorldSpan))
+        let visibleTileKeys = tiles.keys.filter {
+            $0.seed == seed && $0.scaleKey == currentScaleKey
+                && $0.tileX >= minTileX && $0.tileX <= maxTileX
+                && $0.tileZ >= minTileZ && $0.tileZ <= maxTileZ
+        }
         for key in visibleTileKeys {
             tileRecencyClock &+= 1
             tileRecency[key] = tileRecencyClock
@@ -132,6 +153,7 @@ final class NativeMapView: NSView {
             tileZ: tile.tileZ
         )
         tiles[key] = tile
+        invalidateStructureMarkerCache()
         tileRecencyClock &+= 1
         tileRecency[key] = tileRecencyClock
         if let image = makeImage(for: tile) {
@@ -145,6 +167,7 @@ final class NativeMapView: NSView {
         tiles.removeAll(keepingCapacity: true)
         tileImages.removeAll(keepingCapacity: true)
         tileRecency.removeAll(keepingCapacity: true)
+        invalidateStructureMarkerCache()
     }
 
     private func evictTileCacheIfNeeded() {
@@ -153,18 +176,44 @@ final class NativeMapView: NSView {
             tiles.removeValue(forKey: oldest)
             tileImages.removeValue(forKey: oldest)
             tileRecency.removeValue(forKey: oldest)
+            invalidateStructureMarkerCache()
         }
     }
 
     func visibleStructures() -> [MapStructurePresentation] {
-        guard let seed = currentSeed else { return [] }
-        return Array(Set(tiles.compactMap { key, tile in
-            key.seed == seed && key.scaleKey == currentScaleKey
-                ? tile.structures.filter { enabledStructureSets.contains($0.setID) }
-                : []
-        }.flatMap { $0 })).sorted {
+        let cacheKey = NativeStructureMarkerCacheKey(
+            seed: currentSeed,
+            scaleKey: currentScaleKey,
+            enabledStructureSets: enabledStructureSets,
+            tileRevision: structureMarkerTileRevision
+        )
+        if structureMarkerCacheKey == cacheKey {
+            return structureMarkerCache
+        }
+        guard let seed = currentSeed else {
+            structureMarkerCache = []
+            structureMarkerCacheKey = cacheKey
+            return []
+        }
+
+        var markers = Set<MapStructurePresentation>()
+        for (tileKey, tile) in tiles
+        where tileKey.seed == seed && tileKey.scaleKey == currentScaleKey {
+            for marker in tile.structures where enabledStructureSets.contains(marker.setID) {
+                markers.insert(marker)
+            }
+        }
+        structureMarkerCache = markers.sorted {
             ($0.z, $0.x, $0.setID, $0.structureID) < ($1.z, $1.x, $1.setID, $1.structureID)
         }
+        structureMarkerCacheKey = cacheKey
+        return structureMarkerCache
+    }
+
+    private func invalidateStructureMarkerCache() {
+        structureMarkerTileRevision &+= 1
+        structureMarkerCacheKey = nil
+        structureMarkerCache.removeAll(keepingCapacity: true)
     }
 
     func biome(at point: CGPoint) -> (name: String?, x: Int, z: Int) {

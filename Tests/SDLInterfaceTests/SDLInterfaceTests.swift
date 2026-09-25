@@ -27,6 +27,12 @@ import DapperMapEngine
     #expect(edit.visibleStart(capacity: 3) == 2)
 }
 
+@Test func worldSeedParsingPreservesNegativeBitPatterns() {
+    #expect(MapMath.parseWorldSeed("-1") == -1)
+    #expect(MapMath.parseWorldSeed("-9223372036854775808") == Int64.min)
+    #expect(MapMath.parseWorldSeed("18446744073709551615") == -1)
+}
+
 @Test func wrappingHandlesLongItemIDsAndBlankLines() {
     let lines = wrappedSDLLines("minecraft:enchanted_golden_apple\n\nPotion of healing", columns: 12)
     #expect(lines.allSatisfy { $0.count <= 12 })

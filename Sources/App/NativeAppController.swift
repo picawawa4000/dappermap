@@ -11,6 +11,11 @@ import AppKit
 import CoreGraphics
 #endif
 
+private enum NativeTileGenerationResult: Sendable {
+    case biome(Result<MapTilePresentation, Error>)
+    case structures(Result<MapTileStructuresPresentation, Error>)
+}
+
 #if canImport(wasi_pthread)
 import wasi_pthread
 import WASILibc
@@ -71,6 +76,10 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
     private var currentDimensionID = "minecraft:overworld"
     private var completedTiles = 0
     private var pendingTiles = 0
+    private var completedStructureTiles = 0
+    private var pendingStructureTiles = 0
+    private var deferredStructureResults: [NativeTileKey: MapTileStructuresPresentation] = [:]
+    private var tileGenerationMode: MapTileGenerationMode = .combined
     private var awaitingFirstTileForSeed = false
 
     override init() {
@@ -96,6 +105,11 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             label: "Loot Search Threads",
             value: "\(lootSearchThreadCount)",
             kind: .integer(defaultValue: lootSearchThreadCount, range: 1...4)
+        ), SidebarField(
+            id: "tile-generation-mode",
+            label: "Tile Scheduling",
+            value: tileGenerationMode.title,
+            kind: .text
         ), SidebarField(
             id: "llvm",
             label: "LLVM Density Compilation",
@@ -478,6 +492,13 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             let llvm = NSButton(checkboxWithTitle: "LLVM Density Compilation", target: self, action: #selector(llvmCompilationChanged(_:)))
             llvm.state = enableDensityCompilation ? .on : .off
             stack.addArrangedSubview(llvm)
+            stack.addArrangedSubview(label("Tile Scheduling", size: 12, bold: true))
+            let scheduling = NSPopUpButton()
+            for mode in MapTileGenerationMode.allCases { scheduling.addItem(withTitle: mode.title) }
+            scheduling.selectItem(at: MapTileGenerationMode.allCases.firstIndex(of: tileGenerationMode) ?? 0)
+            scheduling.target = self
+            scheduling.action = #selector(tileGenerationModeChanged(_:))
+            stack.addArrangedSubview(scheduling)
             let metrics = wrappingLabel("Waiting for a render")
             metrics.font = NSFont(name: "Menlo", size: 11) ?? .monospacedSystemFont(ofSize: 11, weight: .regular)
             metrics.widthAnchor.constraint(equalToConstant: 324).isActive = true
@@ -867,14 +888,7 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             return
         }
         let raw = seedInput?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let seed: Int64?
-        if let signed = Int64(raw) {
-            seed = signed
-        } else if let unsigned = UInt64(raw) {
-            seed = Int64(bitPattern: unsigned)
-        } else {
-            seed = nil
-        }
+        let seed = MapMath.parseWorldSeed(raw)
         guard let seed else {
             commonBase.render(status: "Enter a valid 64-bit Minecraft seed.", isError: true)
             return
@@ -934,6 +948,18 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         guard enabled != enableDensityCompilation else { return }
         enableDensityCompilation = enabled
         loadDatapack(threadCount: threadCount)
+    }
+
+    @objc private func tileGenerationModeChanged(_ sender: NSPopUpButton) {
+        guard let title = sender.titleOfSelectedItem,
+              let mode = MapTileGenerationMode.allCases.first(where: { $0.title == title }),
+              mode != tileGenerationMode
+        else { return }
+        tileGenerationMode = mode
+        // Cached complete tiles would hide the scheduling experiment.
+        mapView.removeAllTiles()
+        deferredStructureResults.removeAll(keepingCapacity: true)
+        if currentSeed != nil { renderVisibleRegion() }
     }
 
     @objc private func minecraftVersionChanged() {
@@ -1040,7 +1066,10 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             centerTileZ: centerTileZ
         ) {
                 let key = NativeTileKey(seed: seed, scaleKey: scaleKey, tileX: tileX, tileZ: tileZ)
-                guard mapView.tiles[key] == nil else { continue }
+                if let cached = mapView.tiles[key],
+                   enabledStructureSets.isEmpty || cached.structuresComplete {
+                    continue
+                }
                 requests.append(MapTileRequest(
                     generation: activeGeneration,
                     seed: seed,
@@ -1059,6 +1088,9 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         }
         pendingTiles = requests.count
         completedTiles = 0
+        pendingStructureTiles = enabledStructureSets.isEmpty ? 0 : requests.count
+        completedStructureTiles = 0
+        deferredStructureResults.removeAll(keepingCapacity: true)
         biomeGenerationStatusLabel?.stringValue = requests.isEmpty
             ? "Biomes: ready from tile cache."
             : "Biomes: 0/\(requests.count) tile(s) ready."
@@ -1076,6 +1108,14 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
             ? "Generating centre biome tiles…"
             : "Rendering seed \(seed) on \(threadCount) thread\(threadCount == 1 ? "" : "s"). Loading \(requests.count) tile(s)…")
         updateDebug(lastTile: nil)
+        if tileGenerationMode != .combined {
+            scheduleSplitTileGeneration(
+                requests: requests,
+                scheduler: scheduler,
+                generation: activeGeneration
+            )
+            return
+        }
         let concurrency = threadCount
         renderTask = Task { [weak self] in
             await withTaskGroup(of: Result<MapTilePresentation, Error>.self) { group in
@@ -1084,7 +1124,13 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
                     let request = requests[nextRequest]
                     nextRequest += 1
                     group.addTask {
-                        do { return .success(try await scheduler.generateTile(request)) }
+                        do {
+                            return .success(try await scheduler.generateTile(request) { [weak self] in
+                                Task { @MainActor [weak self] in
+                                    self?.structureGenerationStatusLabel?.stringValue = "Generating strongholds…"
+                                }
+                            })
+                        }
                         catch { return .failure(error) }
                     }
                 }
@@ -1093,7 +1139,13 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
                         let request = requests[nextRequest]
                         nextRequest += 1
                         group.addTask {
-                            do { return .success(try await scheduler.generateTile(request)) }
+                        do {
+                            return .success(try await scheduler.generateTile(request) { [weak self] in
+                                Task { @MainActor [weak self] in
+                                    self?.structureGenerationStatusLabel?.stringValue = "Generating strongholds…"
+                                }
+                            })
+                        }
                             catch { return .failure(error) }
                         }
                     }
@@ -1112,9 +1164,100 @@ final class NativeAppController: NSObject, DapperMapPlatform, NativeMapViewDeleg
         }
     }
 
+    private func scheduleSplitTileGeneration(
+        requests: [MapTileRequest],
+        scheduler: NativeGenerationPlatform,
+        generation activeGeneration: Int
+    ) {
+        let mode = tileGenerationMode
+        renderTask = Task { [weak self] in
+            await withTaskGroup(of: NativeTileGenerationResult.self) { group in
+                for request in requests {
+                    group.addTask {
+                        do { return .biome(.success(try await scheduler.generateBiomeTile(request))) }
+                        catch { return .biome(.failure(error)) }
+                    }
+                    if mode == .parallelStructures, !(request.enabledStructureSets ?? []).isEmpty {
+                        group.addTask {
+                            do {
+                                return .structures(.success(try await scheduler.generateStructures(for: request) { [weak self] in
+                                    Task { @MainActor [weak self] in
+                                        self?.structureGenerationStatusLabel?.stringValue = "Generating strongholds…"
+                                    }
+                                }))
+                            }
+                            catch { return .structures(.failure(error)) }
+                        }
+                    }
+                }
+                for await result in group {
+                    guard let self, activeGeneration == self.generation else { continue }
+                    switch result {
+                    case .biome(.success(let tile)):
+                        self.installSplitBiomeTile(tile)
+                        if mode == .deferredStructures,
+                           !self.enabledStructureSets.isEmpty,
+                           let request = requests.first(where: { $0.tileX == tile.tileX && $0.tileZ == tile.tileZ }) {
+                            group.addTask {
+                                do {
+                                    return .structures(.success(try await scheduler.generateStructures(for: request) { [weak self] in
+                                        Task { @MainActor [weak self] in
+                                            self?.structureGenerationStatusLabel?.stringValue = "Generating strongholds…"
+                                        }
+                                    }))
+                                }
+                                catch { return .structures(.failure(error)) }
+                            }
+                        }
+                    case .structures(.success(let structures)):
+                        self.installSplitStructures(structures)
+                    case .biome(.failure(let error)), .structures(.failure(let error)):
+                        self.commonBase.render(status: "Render failed: \(error)", isError: true)
+                    }
+                }
+            }
+        }
+    }
+
+    private func installSplitBiomeTile(_ tile: MapTilePresentation) {
+        guard tile.generation == generation, tile.seed == currentSeed else { return }
+        mapView.install(tile: tile)
+        completedTiles += 1
+        pendingTiles = max(0, pendingTiles - 1)
+        awaitingFirstTileForSeed = false
+        biomeGenerationStatusLabel?.stringValue = "Biomes: \(completedTiles)/\(completedTiles + pendingTiles) tile(s) ready."
+        updateDebug(lastTile: tile)
+        let key = NativeTileKey(seed: tile.seed, scaleKey: tile.scaleKey, tileX: tile.tileX, tileZ: tile.tileZ)
+        if let structures = deferredStructureResults.removeValue(forKey: key) {
+            installSplitStructures(structures)
+        }
+    }
+
+    private func installSplitStructures(_ structures: MapTileStructuresPresentation) {
+        guard structures.generation == generation, structures.seed == currentSeed else { return }
+        let key = NativeTileKey(seed: structures.seed, scaleKey: structures.scaleKey, tileX: structures.tileX, tileZ: structures.tileZ)
+        guard let tile = mapView.tiles[key], tile.generation == structures.generation else {
+            deferredStructureResults[key] = structures
+            return
+        }
+        mapView.install(tile: MapTilePresentation(
+            generation: tile.generation, seed: tile.seed, scaleKey: tile.scaleKey, tileX: tile.tileX, tileZ: tile.tileZ,
+            width: tile.width, height: tile.height, palette: tile.palette, biomeIndices: tile.biomeIndices,
+            structures: structures.structures, structuresComplete: true, generationMilliseconds: tile.generationMilliseconds,
+            densityCompilationMilliseconds: tile.densityCompilationMilliseconds,
+            densityCompilationBackend: tile.densityCompilationBackend
+        ))
+        completedStructureTiles += 1
+        pendingStructureTiles = max(0, pendingStructureTiles - 1)
+        structureGenerationStatusLabel?.stringValue = pendingStructureTiles == 0
+            ? "Structures: ready."
+            : "Structures: \(completedStructureTiles)/\(completedStructureTiles + pendingStructureTiles) tile(s) ready."
+    }
+
     private func updateDebug(lastTile: MapTilePresentation?) {
         var lines = [
             "Threads: \(threadCount)",
+            "Tile scheduling: \(tileGenerationMode.title)",
             "Pending tiles: \(pendingTiles)",
             "Cached tiles: \(mapView.tiles.count)"
         ]

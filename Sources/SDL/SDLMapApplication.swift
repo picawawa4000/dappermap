@@ -4,6 +4,14 @@ import DPReader
 import Foundation
 import SDL2
 
+struct SDLStructureMarkerCacheKey: Hashable {
+    let seed: Int64
+    let sampleY: Int32
+    let scaleKey: Int
+    let enabledStructureSets: Set<String>
+    let tileRevision: UInt64
+}
+
 @MainActor
 final class SDLMapApplication {
     var mapWidth = 768
@@ -19,11 +27,19 @@ final class SDLMapApplication {
     var threadCount = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
     var lootSearchThreadCount = 1
     var enableDensityCompilation = ProcessInfo.processInfo.environment["DAPPERMAP_ENABLE_LLVM"] == "1"
+    var tileGenerationMode: MapTileGenerationMode = .combined
     var tile: MapTilePresentation?
     var tiles: [SDLTileKey: MapTilePresentation] = [:]
     var tileTextures: [SDLTileKey: OpaquePointer] = [:]
     var tileRecency: [SDLTileKey: UInt64] = [:]
     var tileRecencyClock: UInt64 = 0
+    var deferredStructureResults: [SDLTileKey: MapTileStructuresPresentation] = [:]
+    /// Marker collection is substantially more expensive than drawing the markers themselves.
+    /// Cache it across frames and invalidate when the tile set changes; the lookup key also
+    /// captures all view-state fields which can alter the selected marker set.
+    var structureMarkerTileRevision: UInt64 = 0
+    var structureMarkerCacheKey: SDLStructureMarkerCacheKey?
+    var structureMarkerCache: [MapStructurePresentation] = []
     let maximumCachedTiles = 128
     var needsTextureRebuild = false
     var tooltip = ""
@@ -293,9 +309,16 @@ final class SDLMapApplication {
         if hasRendered { resizeDeadline = SDL_GetTicks() &+ 150 }
     }
     func renderInputs() {
-        guard let value = Int64(fields["seed", default: ""]) ?? UInt64(fields["seed", default: ""]).map({ Int64(bitPattern: $0) }) else {
+        // SDL text input events and button activation can be delivered in adjacent event-loop
+        // turns. Synchronize the editor snapshot before reading the backing field so a leading
+        // minus cannot be lost to an older field value.
+        blur()
+        guard let value = MapMath.parseWorldSeed(fields["seed", default: ""]) else {
             status = "Seed must be a signed or unsigned 64-bit integer."; focus("seed"); return
         }
+        // Canonicalize the field after parsing so the UI and every subsequent request show the
+        // same signed representation, including seeds whose high bit is set.
+        fields["seed"] = String(value)
         guard let y = Int32(fields["y", default: ""]), (-64...316).contains(y) else {
             status = "Y must be a whole number from -64 to 316."; focus("y"); return
         }
@@ -329,9 +352,15 @@ final class SDLMapApplication {
         case "version-next": changeDatapackVersion(by: 1)
         case "copy-seed": SDL_SetClipboardText(fields["seed", default: ""])
         case "paste-seed":
+            blur()
             if let text = SDL_GetClipboardText() { fields["seed"] = String(cString: text).trimmingCharacters(in: .whitespacesAndNewlines); SDL_free(text) }
             focus("seed")
-        case "random-seed": fields["seed"] = String(Int64.random(in: .min ... .max))
+        case "random-seed":
+            // A focused editor owns a snapshot of the field. Blur it before replacing the
+            // backing value, otherwise the next click/blur writes the old seed back over this
+            // newly generated one (most visible when the random value is negative).
+            blur()
+            fields["seed"] = String(Int64.random(in: .min ... .max))
         case "go":
             guard let x = Int32(fields["x", default: ""]), let z = Int32(fields["z", default: ""]) else { status = "X and Z must be 32-bit whole numbers."; return }
             centerX = Double(x); centerZ = Double(z)
@@ -354,6 +383,9 @@ final class SDLMapApplication {
         case "search-threads-minus": lootSearchThreadCount = max(1, lootSearchThreadCount - 1)
         case "search-threads-plus": lootSearchThreadCount = min(4, lootSearchThreadCount + 1)
         case "llvm": enableDensityCompilation.toggle()
+        case "tile-scheduling":
+            let modes = MapTileGenerationMode.allCases
+            tileGenerationMode = modes[(modes.firstIndex(of: tileGenerationMode)! + 1) % modes.count]
         case "apply-settings": invalidateLoot(); if hasRendered { requestRegenerate() }
         case "source": SDL_OpenURL("https://github.com/picawawa4000/dappermap")
         case "dpreader": SDL_OpenURL("https://github.com/picawawa4000/dpreader-swift")
@@ -437,9 +469,29 @@ final class SDLMapApplication {
     }
     var visibleStructures: [MapStructurePresentation] {
         let scale = MapMath.scaleKey(for: MapMath.tileBlocksPerPixel(for: blocksPerPixel))
-        return Array(Set(tiles.filter { $0.key.seed == seed && $0.key.sampleY == sampleY && $0.key.scaleKey == scale }.values.flatMap(\.structures)))
-            .filter { enabledStructureSets.contains($0.setID) }
-            .sorted { ($0.z, $0.x, $0.structureID) < ($1.z, $1.x, $1.structureID) }
+        let cacheKey = SDLStructureMarkerCacheKey(
+            seed: seed,
+            sampleY: sampleY,
+            scaleKey: scale,
+            enabledStructureSets: enabledStructureSets,
+            tileRevision: structureMarkerTileRevision
+        )
+        if structureMarkerCacheKey == cacheKey {
+            return structureMarkerCache
+        }
+
+        var markers = Set<MapStructurePresentation>()
+        for (tileKey, tile) in tiles
+        where tileKey.seed == seed && tileKey.sampleY == sampleY && tileKey.scaleKey == scale {
+            for marker in tile.structures where enabledStructureSets.contains(marker.setID) {
+                markers.insert(marker)
+            }
+        }
+        structureMarkerCache = markers.sorted {
+            ($0.z, $0.x, $0.structureID) < ($1.z, $1.x, $1.structureID)
+        }
+        structureMarkerCacheKey = cacheKey
+        return structureMarkerCache
     }
     var visibleContainers: [MapLootPresentation] {
         var result = selectedTabID == "loot-search" ? searchResults : loot
@@ -479,8 +531,13 @@ final class SDLMapApplication {
         let tx = Int(floor(world.x / span)), tz = Int(floor(world.z / span))
         let key = SDLTileKey(seed: seed, sampleY: sampleY, scaleKey: MapMath.scaleKey(for: bpp), tileX: tx, tileZ: tz)
         guard let tile = tiles[key] else { tooltip = "X \(Int(floor(world.x)))  Z \(Int(floor(world.z)))"; return }
-        let lx = min(max(Int((world.x - Double(tx) * span) / bpp), 0), tile.width - 1)
-        let lz = min(max(Int((world.z - Double(tz) * span) / bpp), 0), tile.height - 1)
+        // Raster tiles are normally 128 samples across even though their world span is 256
+        // display pixels.  Use their actual sample stride; indexing by `bpp` shifted the
+        // lookup increasingly far from the pointer and then clamped it at the tile edge.
+        let sampleStrideX = span / Double(tile.width)
+        let sampleStrideZ = span / Double(tile.height)
+        let lx = min(max(Int(floor((world.x - Double(tx) * span) / sampleStrideX)), 0), tile.width - 1)
+        let lz = min(max(Int(floor((world.z - Double(tz) * span) / sampleStrideZ)), 0), tile.height - 1)
         let biome = tile.palette[Int(tile.biomeIndices[lz * tile.width + lx])]
         tooltip = "\(displayName(biome))\nX \(Int(floor(world.x)))  Z \(Int(floor(world.z)))"
     }
